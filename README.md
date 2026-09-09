@@ -17,8 +17,10 @@ SageMaker Training Job (VPC)                              Bedrock AgentCore Runt
                     ▲ trainer calls the agent once per trajectory ─────┘
 ```
 
-Everything here was verified in `us-west-2` (see [`sagemaker/AGENTCORE_VPC_SETUP.md`](sagemaker/AGENTCORE_VPC_SETUP.md)
-for the networking facts and the exact resource IDs of the reference setup).
+Verified end to end in `us-west-2` on 2026-09-09: a `--mode smoke` run on one `ml.p5.48xlarge`
+completed 2 GRPO rollouts with 16 AgentCore-driven trajectories, the session servers logging
+requests from the runtime's VPC ENIs. See [`sagemaker/AGENTCORE_VPC_SETUP.md`](sagemaker/AGENTCORE_VPC_SETUP.md)
+for the networking facts and the exact resource IDs of the reference setup.
 
 ## What you need
 
@@ -139,8 +141,18 @@ Watch prints the marker lines: `HOST_REPORT`, `HEAD_READY`, `RAY_NODES k/N joine
 `Session servers launched`, `trial done`, `rollout/raw_reward`, and any traceback.
 Checkpoints stream to `s3://$MILES_SM_BUCKET/miles/checkpoints/<job>/`.
 
-Capacity note: in our account `ml.g6e.2xlarge ×2` took 6.5 h to be scheduled and
-`ml.g6e.12xlarge ×2` never was within 48 h. Submit, walk away, `watch` later.
+Capacity note: in our account `ml.p5.48xlarge ×1` was scheduled in ~10-20 min, `ml.g6e.2xlarge ×2`
+took 6.5 h, and `ml.g6e.12xlarge ×2` never was within 48 h. Submit, walk away, `watch` later.
+
+Two SageMaker-specific things `entrypoint.py` handles that you would hit otherwise:
+
+* the `model` channel must be linked to `/root/models/<name>` on **every** host, because Ray
+  places SGLang engines on workers too;
+* the trainer runs with `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:False`. SageMaker's
+  container runtime denies `pidfd_getfd`, which torch needs to share expandable-segment CUDA
+  allocations with the colocated engines during weight sync (`RuntimeError: pidfd_getfd:
+  Operation not permitted` in every engine at the first update). Classic CUDA IPC handles do
+  not need it.
 
 ## How the pieces fit
 

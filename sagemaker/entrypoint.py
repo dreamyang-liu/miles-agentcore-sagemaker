@@ -153,11 +153,17 @@ def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
         "PYTHONUNBUFFERED": "1",
     }
     env.pop("RAY_ADDRESS", None)  # execute_train then submits to the local dashboard
+    # SageMaker's container runtime denies pidfd_getfd, which torch needs to share
+    # expandable-segment CUDA allocations with the colocated SGLang engines during weight sync
+    # ("RuntimeError: pidfd_getfd: Operation not permitted" in every engine at the first update).
+    # Classic CUDA IPC handles do not need it, so the trainer runs without expandable segments.
+    train_env_vars = json.dumps({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"})
     cmd = (
         f"python3 {LAUNCHER} --mode {os.environ.get('MILES_SM_MODE', 'smoke')} --agent-mode agentcore "
         f"--skip-prepare --model-name {model_name} --dataset {os.environ.get('MILES_SM_DATASET', 'gsm-hard')} "
         f"--model-dir {MODEL_DIR} --data-dir {DATA_CHANNEL} --output-dir {OUTPUT_DIR} "
-        f"--num-gpus-per-node {gpus} {os.environ.get('MILES_SM_EXTRA_ARGS', '')}"
+        f"--num-gpus-per-node {gpus} --train-env-vars '{train_env_vars}' "
+        f"{os.environ.get('MILES_SM_EXTRA_ARGS', '')}"
     )
     rc = _sh(cmd, env=env, cwd=LAUNCHER.parent).returncode
     logger.info("LAUNCHER_EXIT rc=%s", rc)

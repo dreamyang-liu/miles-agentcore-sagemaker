@@ -74,6 +74,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # Frequent enough that an OOM or a preemption late in the run does not throw the run away.
     save_interval: int = 10
     eval_interval: int = 10
+    # JSON env for the trainer processes. expandable_segments:True is the memory-friendly default,
+    # but sharing such allocations with the colocated SGLang engines (CUDA IPC weight sync) goes
+    # through pidfd_getfd, which SageMaker's container runtime forbids -- pass
+    # '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:False"}' there (sagemaker/entrypoint.py does).
+    train_env_vars: str = '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
 
     agentcore_runtime_arn: str = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
     proxy_base: str = os.environ.get("MILES_PROXY_BASE", "")
@@ -198,7 +203,7 @@ def execute(args: ScriptArgs):
         "--attn-implementation flash_attention_2 "
         "--gradient-checkpointing "
         f"--update-weight-buffer-size {512 * 1024 * 1024} "
-        """--train-env-vars '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}' """
+        f"--train-env-vars '{args.train_env_vars}' "
     )
 
     sglang_args = (
