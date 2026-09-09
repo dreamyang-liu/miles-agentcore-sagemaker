@@ -1,9 +1,9 @@
 """Shared bits for the SageMaker launchers here: account constants, VPC config, log tailing.
 
-Environment (all optional; the defaults are the reference account this was built in):
+Environment:
     AWS_REGION          region of the VPC, ECR repos and jobs         (default us-west-2)
-    MILES_SM_ROLE_ARN   SageMaker execution role ARN                  (default: the reference role)
-    MILES_SM_BUCKET     S3 bucket for model/data channels + outputs   (default: the reference bucket)
+    MILES_SM_ROLE_ARN   SageMaker execution role ARN                  (required)
+    MILES_SM_BUCKET     S3 bucket for model/data channels + outputs   (required)
 """
 
 from __future__ import annotations
@@ -20,10 +20,15 @@ import boto3
 REGION = os.environ.get("AWS_REGION", "us-west-2")
 ACCOUNT = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
 ECR = f"{ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com"
-ROLE = os.environ.get(
-    "MILES_SM_ROLE_ARN", f"arn:aws:iam::{ACCOUNT}:role/service-role/AmazonSageMaker-ExecutionRole-20250421T134015"
-)
-BUCKET = os.environ.get("MILES_SM_BUCKET", "drmyang-sagemaker-us-west-2")
+def _required(name: str, what: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise SystemExit(f"{name} must be set: {what}")
+    return value
+
+
+ROLE = _required("MILES_SM_ROLE_ARN", "ARN of a SageMaker execution role (trusts sagemaker.amazonaws.com)")
+BUCKET = _required("MILES_SM_BUCKET", "S3 bucket for model/data channels, checkpoints and outputs")
 LOG_GROUP = "/aws/sagemaker/TrainingJobs"
 INFRA = json.loads(Path(__file__).with_name(".infra.json").read_text())
 

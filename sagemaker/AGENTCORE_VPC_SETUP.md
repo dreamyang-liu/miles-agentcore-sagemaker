@@ -4,7 +4,7 @@ You are setting up networking so that an **Amazon Bedrock AgentCore Runtime** (t
 agent) can open TCP connections **directly** to the Miles session servers running inside a
 **SageMaker Training Job** — no proxy, no NLB, no public IP. Miles' session server has no
 authentication, so the security group is the entire boundary. Everything below was verified
-end to end in account `241580540779`, region `us-west-2` (2026-09-04); IDs are given as the
+end to end in account `<ACCOUNT>`, region `us-west-2` (2026-09-04); IDs are given as the
 concrete reference, adapt names if you rebuild elsewhere.
 
 ## Facts you must design around
@@ -64,8 +64,8 @@ in the VPC (and nothing outside it) can reach the session servers.
 
   — only the three supported-AZ subnets; including the az4 subnet fails the whole create.
 * Reference runtime: `miles_math_agent_vpc-pZqJtz42PV`
-  (`arn:aws:bedrock-agentcore:us-west-2:241580540779:runtime/miles_math_agent_vpc-pZqJtz42PV`),
-  image `241580540779.dkr.ecr.us-west-2.amazonaws.com/miles-agentcore-math:latest`
+  (`arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT>:runtime/miles_math_agent_vpc-pZqJtz42PV`),
+  image `<ACCOUNT>.dkr.ecr.us-west-2.amazonaws.com/miles-agentcore-math:latest`
   (linux/arm64 — required by the default microVM compute type).
 * The invocation payload carries the session URL directly:
   `"base_url": "http://<head-vpc-ip>:<port>/sessions/<sid>/v1"`. The `token` field is a

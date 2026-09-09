@@ -18,7 +18,7 @@ set -euo pipefail
 AGENT_MODE="${1:-local}"
 MODE="${MODE:-smoke}"
 NAME="${NAME:-miles-train}"
-HOST_REPO="${HOST_REPO:-/home/ec2-user/Projects/miles}"
+HOST_REPO="${HOST_REPO:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)}"
 # Passed through to the launcher verbatim, so recipe knobs do not need a wrapper flag each.
 EXTRA_ARGS="${EXTRA_ARGS:-}"
 
@@ -50,10 +50,10 @@ docker run -d --name "$NAME" \
   --ulimit memlock=-1 --ulimit stack=67108864 \
   --cap-add SYS_PTRACE --security-opt seccomp=unconfined \
   -v "$HOST_REPO:/root/miles" \
-  -v /home/ec2-user/models:/root/models \
-  -v /home/ec2-user/data:/root/data \
-  -v /home/ec2-user/shared_data:/root/shared_data \
-  -v /home/ec2-user/.aws:/root/.aws:ro \
+  -v $HOME/models:/root/models \
+  -v $HOME/data:/root/data \
+  -v $HOME/shared_data:/root/shared_data \
+  -v $HOME/.aws:/root/.aws:ro \
   "${extra_env[@]}" \
   -w /root/miles/examples/experimental/agentcore \
   --entrypoint bash radixark/miles:latest -c \
