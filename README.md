@@ -179,6 +179,35 @@ template and the `qwen3_coder` tool-call parser. Adapter checkpoints (~390 MB) l
 `s3://$MILES_SM_BUCKET/miles/checkpoints/<job>/…/iter_*/adapter/`. gsm-hard saturates for a
 27B within a couple of steps (reward 1.0, zero advantage) — pick a harder dataset for real training.
 
+## Variant: an unmodified SageMaker-RFT agent (Strands + `sagemaker.train.rft`)
+
+Agents written for SageMaker RFT do not accept a per-trajectory model URL: they call a fixed
+`$RFT_RUNTIME_ENDPOINT/v1/chat/completions` with the trajectory in an
+`X-Amzn-SageMaker-Trajectory-Id` header and report to `/complete-rollout` + `/update-reward`.
+`rft_front_door.py`, started by the entrypoint on the training head (port 30100), bridges
+that to Miles' per-session URLs; a Route 53 private zone (`miles.internal`, created by
+`infra.py`) gives the head a stable name that the entrypoint points at its IP for each job.
+
+```bash
+MILES_SM_ROLE_NAME=<your-sagemaker-execution-role-name> python sagemaker/infra.py   # adds zone + SG rule + Route 53 policy
+python sagemaker/convert_rft_parquet.py training_prompts.parquet --name rft-gsm8k --output-dir /tmp/data
+aws s3 cp /tmp/data/rft-gsm8k_train.jsonl s3://$MILES_SM_BUCKET/miles/data/ && aws s3 cp /tmp/data/rft-gsm8k_eval.jsonl s3://$MILES_SM_BUCKET/miles/data/
+python sagemaker/agentcore_runtime.py create --name rft_gsm8k_agent_vpc --image-uri <ecr>/<your-rft-agent-image> \
+  --env AGENT_MODE=gsm8k --env RFT_STREAM_INFERENCE=true \
+  --env RFT_RUNTIME_ENDPOINT=http://miles-head.miles.internal:30100 --env RFT_RUNTIME_URL=http://miles-head.miles.internal:30100
+# network check without GPUs:
+JOB=$(python sagemaker/launch_smoke.py start --rft); python sagemaker/launch_smoke.py watch $JOB
+python sagemaker/agentcore_runtime.py invoke-rft --front-door-url http://miles-head.miles.internal:30100
+# training:
+python sagemaker/launch_train.py start --mode smoke --agent-mode rft --model-name Qwen3-0.6B --dataset rft-gsm8k --instance-type ml.p5.48xlarge --count 1
+```
+
+`rft_agent_function.py` builds the RFT payload (`prompt` = JSON string of the record with
+`reward_spec.ground_truth`, `metadata.trajectory_id` = the Miles session id) and maps the
+agent's `agent_answer` back to `submitted_answer`, so `math_reward.py` grades as usual. Verified
+2026-09-09 on the network smoke: the agent resolved the private name from its VPC ENI, streamed
+three turns through the front door and posted its reward back.
+
 ## How the pieces fit
 
 | File | Role |

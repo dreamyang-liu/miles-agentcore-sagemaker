@@ -18,8 +18,11 @@ Outputs go under ``/opt/ml/checkpoints`` so ``CheckpointConfig`` streams them to
 Environment (set by ``launch_train.py``):
     MILES_SM_MODE            smoke | normal            (default smoke)
     MILES_SM_MODEL_NAME      e.g. Qwen3-0.6B
-    MILES_SM_DATASET         gsm8k | gsm-hard
+    MILES_SM_DATASET         gsm8k | gsm-hard | rft-gsm8k ...
+    MILES_SM_AGENT_MODE      agentcore | rft           (default agentcore)
     MILES_SM_EXTRA_ARGS      appended to the launcher command line
+    MILES_RFT_FRONT_DOOR     "1": start rft_front_door.py on the head and publish its address as
+                             MILES_HEAD_DNS (Route 53 zone MILES_ROUTE53_ZONE_ID) : MILES_RFT_FRONT_DOOR_PORT
     AGENTCORE_RUNTIME_ARN    passed through to the agent function
     AWS_REGION, AGENTCORE_MAX_CONCURRENT, WANDB_API_KEY  passed through if present
 """
@@ -38,6 +41,8 @@ import sys
 import time
 from pathlib import Path
 
+import httpx
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s sm-entrypoint %(message)s")
 logger = logging.getLogger("sm-entrypoint")
 
@@ -50,6 +55,7 @@ MODEL_DIR = Path("/root/models")
 OUTPUT_DIR = Path("/opt/ml/checkpoints")
 RAY_PORT = 6379
 JOIN_TIMEOUT_S = 900
+FRONT_DOOR = REPO / "examples/experimental/agentcore/rft_front_door.py"
 
 
 def _iface_ipv4(iface: str) -> str | None:
@@ -121,10 +127,60 @@ def _link_model(model_name: str) -> None:
         raise SystemExit(f"model channel at {MODEL_CHANNEL} has no config.json")
 
 
+def _upsert_head_dns(zone_id: str, name: str, ip: str) -> None:
+    """Point the private name at this head so a runtime's fixed endpoint follows the job."""
+    import boto3
+
+    route53 = boto3.client("route53")
+    change = route53.change_resource_record_sets(
+        HostedZoneId=zone_id,
+        ChangeBatch={
+            "Comment": os.environ.get("TRAINING_JOB_NAME", "miles"),
+            "Changes": [
+                {
+                    "Action": "UPSERT",
+                    "ResourceRecordSet": {"Name": name, "Type": "A", "TTL": 30, "ResourceRecords": [{"Value": ip}]},
+                }
+            ],
+        },
+    )["ChangeInfo"]
+    logger.info("HEAD_DNS %s -> %s (%s)", name, ip, change["Status"])
+
+
+def _start_front_door(port: int) -> subprocess.Popen:
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(FRONT_DOOR), "--host", "0.0.0.0", "--port", str(port)],
+        env={**os.environ, "PYTHONPATH": str(REPO), "PYTHONUNBUFFERED": "1"},
+    )
+    deadline = time.monotonic() + 60
+    while time.monotonic() < deadline:
+        try:
+            with httpx.Client(timeout=2) as client:
+                if client.get(f"http://127.0.0.1:{port}/health").status_code == 200:
+                    logger.info("FRONT_DOOR_READY port=%s pid=%s", port, proc.pid)
+                    return proc
+        except httpx.HTTPError:
+            pass
+        time.sleep(1)
+    raise RuntimeError("rft_front_door did not become healthy")
+
+
 def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
     hosts = cfg["hosts"]
     model_name = os.environ.get("MILES_SM_MODEL_NAME", "Qwen3-0.6B")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+    front_door = None
+    front_door_env: dict[str, str] = {}
+    if os.environ.get("MILES_RFT_FRONT_DOOR") == "1":
+        port = int(os.environ.get("MILES_RFT_FRONT_DOOR_PORT", "30100"))
+        head_dns = os.environ["MILES_HEAD_DNS"]
+        _upsert_head_dns(os.environ["MILES_ROUTE53_ZONE_ID"], head_dns, own_ip)
+        front_door = _start_front_door(port)
+        front_door_env = {
+            "MILES_RFT_FRONT_DOOR_URL": f"http://{head_dns}:{port}",
+            "MILES_RFT_FRONT_DOOR_LOCAL": f"http://127.0.0.1:{port}",
+        }
 
     _sh("ray stop --force >/dev/null 2>&1; true")
     rc = _sh(
@@ -146,6 +202,7 @@ def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
 
     env = {
         **os.environ,
+        **front_door_env,
         "MILES_SCRIPT_EXTERNAL_RAY": "1",
         "MASTER_ADDR": own_ip,
         "SLURM_JOB_NUM_NODES": str(len(hosts)),
@@ -159,7 +216,8 @@ def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
     # Classic CUDA IPC handles do not need it, so the trainer runs without expandable segments.
     train_env_vars = json.dumps({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"})
     cmd = (
-        f"python3 {LAUNCHER} --mode {os.environ.get('MILES_SM_MODE', 'smoke')} --agent-mode agentcore "
+        f"python3 {LAUNCHER} --mode {os.environ.get('MILES_SM_MODE', 'smoke')} "
+        f"--agent-mode {os.environ.get('MILES_SM_AGENT_MODE', 'agentcore')} "
         f"--skip-prepare --model-name {model_name} --dataset {os.environ.get('MILES_SM_DATASET', 'gsm-hard')} "
         f"--model-dir {MODEL_DIR} --data-dir {DATA_CHANNEL} --output-dir {OUTPUT_DIR} "
         f"--num-gpus-per-node {gpus} --train-env-vars '{train_env_vars}' "
@@ -167,6 +225,8 @@ def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
     )
     rc = _sh(cmd, env=env, cwd=LAUNCHER.parent).returncode
     logger.info("LAUNCHER_EXIT rc=%s", rc)
+    if front_door is not None:
+        front_door.terminate()
     _sh("ray stop --force; true")
     return rc
 

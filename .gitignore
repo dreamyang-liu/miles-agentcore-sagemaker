@@ -1,5 +1,5 @@
 __pycache__/
 *.pyc
 wandb/
-sagemaker/.infra.json
-sagemaker/.agentcore_runtime.json
+sagemaker/.infra*.json
+sagemaker/.agentcore_runtime*.json

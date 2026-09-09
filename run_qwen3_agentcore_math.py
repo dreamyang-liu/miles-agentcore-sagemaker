@@ -60,7 +60,9 @@ _PARSERS = {
 @dataclass
 class ScriptArgs(U.ExecuteTrainConfig):
     mode: Literal["normal", "smoke"] = "normal"
-    agent_mode: Literal["local", "agentcore"] = "local"
+    # local: agent loop in-process. agentcore: our agent via AgentCore (base_url in the payload).
+    # rft: an unmodified SageMaker-RFT-contract agent via AgentCore, through rft_front_door.py.
+    agent_mode: Literal["local", "agentcore", "rft"] = "local"
     run_id: str = U.create_run_id()
     skip_prepare: bool = False
 
@@ -69,7 +71,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     # stops being decorative. On plain gsm8k a 4B policy scores 1.0 from the first rollout
     # (zero within-group variance, so GRPO has no gradient) and a 0.6B one learns to answer
     # from mental arithmetic while calling the tool for show.
-    dataset: Literal["gsm8k", "gsm-hard"] = "gsm-hard"
+    # Any name works as long as <data_dir>/<dataset>_train.jsonl (and _eval.jsonl for eval) exist,
+    # e.g. the RFT parquet converted by sagemaker/convert_rft_parquet.py.
+    dataset: str = "gsm-hard"
     model_dir: str = "/root/models"
     data_dir: str = "/root/data"
     # fsdp: full fine-tune, HF checkpoint loaded directly (no megatron_model_type; execute_train
@@ -158,9 +162,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("--train-backend megatron requires --megatron-model-type (and fsdp forbids it)")
         if self.lora_rank and self.train_backend != "megatron":
             raise ValueError("LoRA needs --train-backend megatron; FSDP has no LoRA in Miles")
-        if self.agent_mode == "agentcore":
+        if self.agent_mode in ("agentcore", "rft"):
             if not self.agentcore_runtime_arn:
-                raise ValueError("--agent-mode agentcore requires AGENTCORE_RUNTIME_ARN")
+                raise ValueError(f"--agent-mode {self.agent_mode} requires AGENTCORE_RUNTIME_ARN")
+        if self.agent_mode == "rft" and not os.environ.get("MILES_RFT_FRONT_DOOR_URL"):
+            raise ValueError("--agent-mode rft requires MILES_RFT_FRONT_DOOR_URL (the address the agent resolves)")
             # Proxy mode is opt-in by MILES_PROXY_BASE; then the secret must come with it.
             if self.proxy_base and not self.proxy_secret:
                 raise ValueError("MILES_PROXY_BASE is set, so MILES_PROXY_SECRET is required too")
@@ -178,7 +184,11 @@ class ScriptArgs(U.ExecuteTrainConfig):
 
     @property
     def agent_function_path(self) -> str:
-        return "local_agent_function.run" if self.agent_mode == "local" else "agentcore_agent_function.run"
+        return {
+            "local": "local_agent_function.run",
+            "agentcore": "agentcore_agent_function.run",
+            "rft": "rft_agent_function.run",
+        }[self.agent_mode]
 
 
 def prepare(args: ScriptArgs):
@@ -348,13 +358,19 @@ def execute(args: ScriptArgs):
         # Harbor recipe's convention.
         "PYTHONPATH": f"{SCRIPT_DIR}:{U.repo_base_dir}",
     }
-    if args.agent_mode == "agentcore":
+    if args.agent_mode in ("agentcore", "rft"):
         extra_env_vars |= {
             "AGENTCORE_RUNTIME_ARN": args.agentcore_runtime_arn,
             "AWS_REGION": args.aws_region,
         }
         if args.proxy_base:
             extra_env_vars |= {"MILES_PROXY_BASE": args.proxy_base, "MILES_PROXY_SECRET": args.proxy_secret}
+    if args.agent_mode == "rft":
+        extra_env_vars |= {
+            k: os.environ[k]
+            for k in ("MILES_RFT_FRONT_DOOR_URL", "MILES_RFT_FRONT_DOOR_LOCAL", "TRAINING_JOB_ARN")
+            if k in os.environ
+        }
 
     U.execute_train(
         train_args=train_args,

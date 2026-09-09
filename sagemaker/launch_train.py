@@ -25,7 +25,7 @@ import sm_common as C
 
 # Built from Dockerfile.train; override to point at another repo/tag.
 IMAGE = os.environ.get("MILES_TRAIN_IMAGE", f"{C.ECR}/miles:sagemaker-agentcore")
-RUNTIME = json.loads(Path(__file__).with_name(".agentcore_runtime.json").read_text())
+RUNTIME = json.loads(C.RUNTIME_STATE.read_text())
 
 _MARKERS = re.compile(
     r"(HOST_REPORT|HEAD_READY|RAY_NODES|WORKER_RESOLVED|WORKER_JOINED|WORKER_DONE|LAUNCHER_EXIT|DONE role"
@@ -62,10 +62,22 @@ def start(args: argparse.Namespace) -> None:
             "MILES_SM_MODE": args.mode,
             "MILES_SM_MODEL_NAME": args.model_name,
             "MILES_SM_DATASET": args.dataset,
+            "MILES_SM_AGENT_MODE": args.agent_mode,
             "MILES_SM_EXTRA_ARGS": args.extra_args,
-            "AGENTCORE_RUNTIME_ARN": RUNTIME["agentRuntimeArn"],
+            "AGENTCORE_RUNTIME_ARN": args.runtime_arn or RUNTIME["agentRuntimeArn"],
             "AWS_REGION": C.REGION,
             "AGENTCORE_MAX_CONCURRENT": str(args.agentcore_max_concurrent),
+            **(
+                {
+                    # rft agents resolve a fixed endpoint; the entrypoint points this name at the head.
+                    "MILES_RFT_FRONT_DOOR": "1",
+                    "MILES_RFT_FRONT_DOOR_PORT": str(C.INFRA["front_door_port"]),
+                    "MILES_HEAD_DNS": C.INFRA["head_dns"],
+                    "MILES_ROUTE53_ZONE_ID": C.INFRA["route53_zone_id"],
+                }
+                if args.agent_mode == "rft"
+                else {}
+            ),
         },
         Tags=[{"Key": "project", "Value": "miles-agentcore"}],
     )
@@ -82,6 +94,8 @@ def main() -> None:
     s.add_argument("--model-name", default="Qwen3-0.6B")
     s.add_argument("--dataset", default="gsm-hard")
     s.add_argument("--extra-args", default="")
+    s.add_argument("--agent-mode", choices=["agentcore", "rft"], default="agentcore")
+    s.add_argument("--runtime-arn", default=None, help="AgentCore runtime ARN; default from the account's .agentcore_runtime file")
     s.add_argument("--agentcore-max-concurrent", type=int, default=8)
     s.add_argument("--max-runtime", type=int, default=3 * 3600)
     s.set_defaults(func=start)

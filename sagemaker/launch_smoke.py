@@ -20,7 +20,7 @@ import time
 import sm_common as C
 
 IMAGE = f"{C.ECR}/miles-sagemaker-smoke:latest"
-_MARKERS = re.compile(r"(HOST_REPORT|HEAD_READY|WORKER_RESOLVED|WORKER_PROBE|DONE|POST /sessions|BREACH)")
+_MARKERS = re.compile(r"(HOST_REPORT|HEAD_READY|HEAD_DNS|FRONT_DOOR_READY|WORKER_RESOLVED|WORKER_PROBE|DONE|POST /sessions|forward tid|complete-rollout|update-reward|rejected|BREACH|Error)")
 
 
 def start(args: argparse.Namespace) -> None:
@@ -33,7 +33,20 @@ def start(args: argparse.Namespace) -> None:
         VpcConfig=C.vpc_config(),
         OutputDataConfig={"S3OutputPath": f"s3://{C.BUCKET}/miles-agentcore-smoke/"},
         StoppingCondition={"MaxRuntimeInSeconds": args.duration + 900},
-        Environment={"SMOKE_PORT": str(args.port), "SMOKE_DURATION_S": str(args.duration)},
+        Environment={
+            "SMOKE_PORT": str(args.port),
+            "SMOKE_DURATION_S": str(args.duration),
+            **(
+                {
+                    "MILES_RFT_FRONT_DOOR": "1",
+                    "MILES_RFT_FRONT_DOOR_PORT": str(C.INFRA["front_door_port"]),
+                    "MILES_HEAD_DNS": C.INFRA["head_dns"],
+                    "MILES_ROUTE53_ZONE_ID": C.INFRA["route53_zone_id"],
+                }
+                if args.rft
+                else {}
+            ),
+        },
         Tags=[{"Key": "project", "Value": "miles-agentcore"}],
     )
     print(name)
@@ -47,6 +60,7 @@ def main() -> None:
     s.add_argument("--count", type=int, default=2)
     s.add_argument("--duration", type=int, default=1200)
     s.add_argument("--port", type=int, default=30000)
+    s.add_argument("--rft", action="store_true", help="also run the RFT front door and publish the head's private DNS name")
     s.set_defaults(func=start)
     w = sub.add_parser("watch")
     w.add_argument("job")

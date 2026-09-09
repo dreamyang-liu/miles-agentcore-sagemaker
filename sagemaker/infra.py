@@ -41,11 +41,21 @@ PRIVATE_SUBNETS = {
 }
 # The recipe's session-server range: --session-server-port 30000, up to 32 workers.
 SESSION_PORTS = (30000, 30031)
+# rft_front_door.py on the head, for agents on the SageMaker RFT contract.
+FRONT_DOOR_PORT = 30100
+# Private DNS so a runtime's fixed RFT_RUNTIME_ENDPOINT can follow the head's per-job IP.
+PRIVATE_ZONE = "miles.internal"
+HEAD_DNS = f"miles-head.{PRIVATE_ZONE}"
+# SageMaker execution role that gets Route 53 upsert rights on the zone (optional).
+SAGEMAKER_ROLE_NAME = os.environ.get("MILES_SM_ROLE_NAME", "")
 AGENTCORE_ROLE = os.environ.get("MILES_AGENTCORE_ROLE", "MilesAgentCoreExecRole")
-OUT_FILE = Path(__file__).with_name(".infra.json")
-
 ec2 = boto3.client("ec2", region_name=REGION)
 iam = boto3.client("iam", region_name=REGION)
+route53 = boto3.client("route53", region_name=REGION)
+ACCOUNT = boto3.client("sts", region_name=REGION).get_caller_identity()["Account"]
+# One state file per account, so the same checkout can drive several accounts (credentials
+# select the account; the file name records which one the ids belong to).
+OUT_FILE = Path(__file__).with_name(f".infra.{ACCOUNT}.json")
 
 
 def _tags(name: str) -> list[dict]:
@@ -180,7 +190,51 @@ def ensure_security_groups(vpc_id: str) -> tuple[str, str]:
             "UserIdGroupPairs": [{"GroupId": agent, "Description": "AgentCore to Miles session servers"}],
         },
     )
+    _authorize(
+        train,
+        {
+            "IpProtocol": "tcp",
+            "FromPort": FRONT_DOOR_PORT,
+            "ToPort": FRONT_DOOR_PORT,
+            "UserIdGroupPairs": [{"GroupId": agent, "Description": "AgentCore to the RFT front door"}],
+        },
+    )
     return train, agent
+
+
+def ensure_private_zone(vpc_id: str) -> str:
+    """Route 53 private hosted zone ``miles.internal`` associated with the VPC; returns its id."""
+    for zone in route53.list_hosted_zones_by_name(DNSName=f"{PRIVATE_ZONE}.")["HostedZones"]:
+        if zone["Name"] == f"{PRIVATE_ZONE}." and zone["Config"].get("PrivateZone"):
+            detail = route53.get_hosted_zone(Id=zone["Id"])
+            if any(v["VPCId"] == vpc_id for v in detail.get("VPCs", [])):
+                return zone["Id"].split("/")[-1]
+    zone = route53.create_hosted_zone(
+        Name=PRIVATE_ZONE,
+        VPC={"VPCRegion": REGION, "VPCId": vpc_id},
+        CallerReference=f"{NAME}-{vpc_id}-{int(time.time())}",
+        HostedZoneConfig={"Comment": "Miles x AgentCore: head-node name for the RFT front door", "PrivateZone": True},
+    )["HostedZone"]
+    return zone["Id"].split("/")[-1]
+
+
+def ensure_sagemaker_role_route53_policy(zone_id: str) -> None:
+    """Let the training job (entrypoint) point ``miles-head`` at the head's IP."""
+    if not SAGEMAKER_ROLE_NAME:
+        print("MILES_SM_ROLE_NAME unset: skipping the Route 53 policy on the SageMaker role", file=sys.stderr)
+        return
+    policy = {
+        "Version": "2012-10-17",
+        "Statement": [
+            {
+                "Effect": "Allow",
+                "Action": ["route53:ChangeResourceRecordSets", "route53:ListResourceRecordSets"],
+                "Resource": f"arn:aws:route53:::hostedzone/{zone_id}",
+            },
+            {"Effect": "Allow", "Action": ["route53:GetChange"], "Resource": "arn:aws:route53:::change/*"},
+        ],
+    }
+    iam.put_role_policy(RoleName=SAGEMAKER_ROLE_NAME, PolicyName=f"{NAME}-route53", PolicyDocument=json.dumps(policy))
 
 
 def ensure_agentcore_role() -> str:
@@ -267,9 +321,14 @@ def create() -> dict:
     ensure_security_groups(vpc_id)
     role_arn = ensure_agentcore_role()
     ensure_agentcore_role_eni_policy()
+    zone_id = ensure_private_zone(vpc_id)
+    ensure_sagemaker_role_route53_policy(zone_id)
     summary = show()
     assert summary is not None
     summary["agentcore_role_arn"] = role_arn
+    summary["route53_zone_id"] = zone_id
+    summary["head_dns"] = HEAD_DNS
+    summary["front_door_port"] = FRONT_DOOR_PORT
     summary["private_subnet_ids"] = private_ids
     summary["public_subnet_id"] = public_id
     summary["nat_gateway_id"] = nat_id

@@ -30,7 +30,8 @@ def _required(name: str, what: str) -> str:
 ROLE = _required("MILES_SM_ROLE_ARN", "ARN of a SageMaker execution role (trusts sagemaker.amazonaws.com)")
 BUCKET = _required("MILES_SM_BUCKET", "S3 bucket for model/data channels, checkpoints and outputs")
 LOG_GROUP = "/aws/sagemaker/TrainingJobs"
-INFRA = json.loads(Path(__file__).with_name(".infra.json").read_text())
+INFRA = json.loads(Path(__file__).with_name(f".infra.{ACCOUNT}.json").read_text())
+RUNTIME_STATE = Path(__file__).with_name(f".agentcore_runtime.{ACCOUNT}.json")
 
 sm = boto3.client("sagemaker", region_name=REGION)
 logs = boto3.client("logs", region_name=REGION)

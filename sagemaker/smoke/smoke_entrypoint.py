@@ -15,6 +15,10 @@ read the head's VPC IP straight out of CloudWatch and hand it to ``InvokeAgentRu
 Environment:
     SMOKE_PORT        port the head serves on (default 30000, the recipe's first session-server port)
     SMOKE_DURATION_S  how long the job stays up for probing (default 1200)
+    MILES_RFT_FRONT_DOOR      "1": also run rft_front_door.py on MILES_RFT_FRONT_DOOR_PORT (30100), publish
+                              MILES_HEAD_DNS in Route 53 zone MILES_ROUTE53_ZONE_ID, and pre-register the
+                              trajectory id SMOKE_TRAJECTORY_ID ("smoke-traj") to a fake session -- so an
+                              RFT-contract agent can be invoked from outside with that trajectory id.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ import httpx
 import uvicorn
 
 from fake_session_server import make_app
+from rft_front_door import make_app as make_front_door
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("smoke")
@@ -83,16 +88,47 @@ def _read_resource_config() -> dict:
     return {"current_host": socket.gethostname(), "hosts": [socket.gethostname()], "network_interface_name": "eth0"}
 
 
+def _serve(app, port: int) -> uvicorn.Server:
+    server = uvicorn.Server(uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", access_log=True))
+    threading.Thread(target=server.run, daemon=True).start()
+    return server
+
+
+def _publish_head_dns(vpc_ip: str) -> None:
+    import boto3
+
+    name = os.environ["MILES_HEAD_DNS"]
+    change = boto3.client("route53").change_resource_record_sets(
+        HostedZoneId=os.environ["MILES_ROUTE53_ZONE_ID"],
+        ChangeBatch={"Changes": [{"Action": "UPSERT", "ResourceRecordSet": {
+            "Name": name, "Type": "A", "TTL": 30, "ResourceRecords": [{"Value": vpc_ip}]}}]},
+    )["ChangeInfo"]
+    logger.info("HEAD_DNS %s -> %s (%s)", name, vpc_ip, change["Status"])
+
+
 def _serve_head(vpc_ip: str | None) -> None:
-    app = make_app()
-    config = uvicorn.Config(app, host="0.0.0.0", port=PORT, log_level="info", access_log=True)
-    server = uvicorn.Server(config)
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
+    servers = [_serve(make_app(), PORT)]
+    if os.environ.get("MILES_RFT_FRONT_DOOR") == "1":
+        fd_port = int(os.environ.get("MILES_RFT_FRONT_DOOR_PORT", "30100"))
+        servers.append(_serve(make_front_door(), fd_port))
+        _publish_head_dns(vpc_ip or "127.0.0.1")
+        # Pre-register one trajectory -> a fresh fake session, so the RFT agent can be driven
+        # from outside the VPC with just that trajectory id.
+        tid = os.environ.get("SMOKE_TRAJECTORY_ID", "smoke-traj")
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            try:
+                sid = httpx.post(f"http://127.0.0.1:{PORT}/sessions", timeout=5).json()["session_id"]
+                httpx.post(f"http://127.0.0.1:{fd_port}/miles/register", timeout=5,
+                           json={"trajectory_id": tid, "session_url": f"http://127.0.0.1:{PORT}/sessions/{sid}"}).raise_for_status()
+                break
+            except (httpx.HTTPError, KeyError):
+                time.sleep(1)
+        logger.info("FRONT_DOOR_READY port=%s trajectory_id=%s session_id=%s", fd_port, tid, sid)
     logger.info("HEAD_READY ip=%s port=%s duration_s=%s", vpc_ip, PORT, DURATION_S)
     time.sleep(DURATION_S)
-    server.should_exit = True
-    thread.join(timeout=10)
+    for server in servers:
+        server.should_exit = True
 
 
 def _probe_worker(head_host: str) -> None:
