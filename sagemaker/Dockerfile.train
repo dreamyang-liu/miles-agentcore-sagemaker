@@ -1,0 +1,15 @@
+# Miles image + this example, for SageMaker Training Jobs.
+#
+# The base image already carries an editable install of Miles at /root/miles; only the
+# example directory is layered on top, so the core stays exactly what the image was built
+# with. Build with the agentcore/ directory as context:
+#
+#   cd examples/experimental/agentcore
+#   docker build -f sagemaker/Dockerfile.train -t <ecr>/miles:sagemaker-agentcore .
+ARG BASE=radixark/miles:latest
+FROM ${BASE}
+
+COPY . /root/miles/examples/experimental/agentcore
+
+# SageMaker runs `<image> train`; the entrypoint ignores argv and reads resourceconfig.json.
+ENTRYPOINT ["python3", "-u", "/root/miles/examples/experimental/agentcore/sagemaker/entrypoint.py"]

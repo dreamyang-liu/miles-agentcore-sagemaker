@@ -1,0 +1,3 @@
+This repository is a standalone copy of examples/experimental/agentcore from
+https://github.com/radixark/miles (Apache-2.0). It is meant to be dropped back into that
+path of a Miles checkout; the training image copies it there.
