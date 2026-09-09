@@ -154,6 +154,31 @@ Two SageMaker-specific things `entrypoint.py` handles that you would hit otherwi
   Operation not permitted` in every engine at the first update). Classic CUDA IPC handles do
   not need it.
 
+## Variant: Qwen3.6-27B with Megatron-Bridge + LoRA (8 GPUs)
+
+The same launcher runs the 27B dense hybrid (48 GDN + 16 attention layers) on the Megatron
+backend with a LoRA adapter — LoRA is Megatron-only in Miles. Verified 2026-09-09 on one
+`ml.p5.48xlarge`: TP4 trainer + two TP4 SGLang engines colocated, first weight sync in 2.6 s,
+trainer at ~22 GB/GPU after sync, ~4.5 min per step at batch 8.
+
+```bash
+aws s3 sync <local Qwen3.6-27B> s3://$MILES_SM_BUCKET/miles/models/Qwen3.6-27B/   # 56 GB
+EXTRA="--train-backend megatron --megatron-model-type qwen3.6-27B --tensor-model-parallel-size 4 \
+  --lora-rank 32 --lora-alpha 64 --qkv-format-bshd --no-use-dynamic-batch-size --max-tokens-per-gpu 4096 \
+  --tito-model qwen36 --rollout-num-gpus-per-engine 4 --sglang-mem-fraction-static 0.5 \
+  --lr 4e-5 --adam-beta2 0.95 --weight-decay 0.0"
+python sagemaker/launch_train.py start --mode smoke --instance-type ml.p5.48xlarge --count 1 \
+  --model-name Qwen3.6-27B --agentcore-max-concurrent 32 --extra-args "$EXTRA"
+# full run: add --num-rollout 50 --rollout-batch-size 4 --n-samples-per-prompt 8 --save-interval 10 --no-enable-eval
+```
+
+Notes: `--qkv-format-bshd --no-use-dynamic-batch-size` because megatron-core's GatedDeltaNet
+rejects packed sequences; the default `--target-modules` covers attention, MLP and the GDN
+`in_proj`/`out_proj` (which `all-linear` misses); `--tito-model qwen36` selects the Qwen3.6
+template and the `qwen3_coder` tool-call parser. Adapter checkpoints (~390 MB) land under
+`s3://$MILES_SM_BUCKET/miles/checkpoints/<job>/…/iter_*/adapter/`. gsm-hard saturates for a
+27B within a couple of steps (reward 1.0, zero advantage) — pick a harder dataset for real training.
+
 ## How the pieces fit
 
 | File | Role |
