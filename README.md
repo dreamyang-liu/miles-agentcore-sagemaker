@@ -17,6 +17,9 @@ SageMaker Training Job (VPC)                              Bedrock AgentCore Runt
                     ▲ trainer calls the agent once per trajectory ─────┘
 ```
 
+See [`STATUS.md`](STATUS.md) for exactly what is verified, what is not, the bugs found on the
+way and what each run cost.
+
 Verified end to end in `us-west-2` on 2026-09-09: a `--mode smoke` run on one `ml.p5.48xlarge`
 completed 2 GRPO rollouts with 16 AgentCore-driven trajectories, the session servers logging
 requests from the runtime's VPC ENIs. See [`sagemaker/AGENTCORE_VPC_SETUP.md`](sagemaker/AGENTCORE_VPC_SETUP.md)

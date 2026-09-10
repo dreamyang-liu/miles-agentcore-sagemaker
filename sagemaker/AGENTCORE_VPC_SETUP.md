@@ -63,8 +63,8 @@ in the VPC (and nothing outside it) can reach the session servers.
   ```
 
   — only the three supported-AZ subnets; including the az4 subnet fails the whole create.
-* Reference runtime: `miles_math_agent_vpc-pZqJtz42PV`
-  (`arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT>:runtime/miles_math_agent_vpc-pZqJtz42PV`),
+* Reference runtime: `miles_math_agent_vpc-<suffix>`
+  (`arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT>:runtime/miles_math_agent_vpc-<suffix>`),
   image `<ACCOUNT>.dkr.ecr.us-west-2.amazonaws.com/miles-agentcore-math:latest`
   (linux/arm64 — required by the default microVM compute type).
 * The invocation payload carries the session URL directly:
