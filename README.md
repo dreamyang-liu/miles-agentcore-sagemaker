@@ -208,6 +208,33 @@ agent's `agent_answer` back to `submitted_answer`, so `math_reward.py` grades as
 2026-09-09 on the network smoke: the agent resolved the private name from its VPC ENI, streamed
 three turns through the front door and posted its reward back.
 
+## Two failure modes worth knowing before you run a thinking model
+
+Both were found the expensive way on 2026-09-10 and are fixed here; if you port this recipe
+elsewhere, these are the parts to keep.
+
+**A thinking model needs `reasoning_content` echoed back.** Miles' session server matches the
+history an agent replays against what it stored, comparing `role`, `content`,
+`reasoning_content` and `tool_calls`. Qwen3.6's TITO template keeps the chain of thought, so an
+agent that rebuilds its assistant messages from `content` + `tool_calls` alone mismatches on
+*every* turn; the session rolls back to the empty checkpoint each time, history grows without
+bound (1300+ messages, 80k-token prefills), trials go 5 s → 300 s and the run stalls while each
+turn's recorded tokens are thrown away. `agent/agent.py` now carries the field. For a
+third-party agent that cannot (Strands' `OpenAIModel` drops it), select
+`--session-message-matcher session_message_matcher.matches`: `loose_tool_call` minus
+`reasoning_content`, which still compares content and the whole tool-call structure — much
+narrower than the built-in `role_content_only`.
+
+**Strands sends `stream_options` that the engine will reject.** Strands hardcodes
+`stream_options={"include_usage": true}`, while the session server pops `stream` to drive the
+engine itself; SGLang then rejects the orphaned option and every trajectory dies with a 503.
+`rft_front_door.py` strips it. Symptom: `forward tid=… 503` in the front-door log with zero
+successful trials.
+
+**Fail fast on IAM.** `InvokeAgentRuntime` returning `AccessDenied` used to be treated as a lost
+trial, so Miles resampled forever — two hours of p5 time over one policy ARN. Those errors now
+raise and kill the job at the first rollout.
+
 ## How the pieces fit
 
 | File | Role |

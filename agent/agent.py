@@ -302,6 +302,15 @@ async def run_episode(payload: dict[str, Any]) -> dict[str, Any]:
 
         message = response.choices[0].message
         assistant: dict[str, Any] = {"role": "assistant", "content": message.content or ""}
+        # Thinking models (Qwen3.6 and friends, template preserve_thinking=True) return the
+        # chain of thought in a separate `reasoning_content` field, and the session server's
+        # strict matcher compares it -- it is one of the four template-relevant keys. Dropping
+        # it makes every replayed assistant message mismatch, so the session rolls back to the
+        # empty checkpoint on EVERY turn: history grows unbounded (938+ messages, 80k-token
+        # prefills, 5s -> 300s trials) and each turn's recorded tokens are discarded.
+        # Seen 2026-09-10 on Qwen3.6-27B: 5312 rollbacks, all to `checkpoint -1`.
+        if reasoning := getattr(message, "reasoning_content", None):
+            assistant["reasoning_content"] = reasoning
         if message.tool_calls:
             assistant["tool_calls"] = [
                 {

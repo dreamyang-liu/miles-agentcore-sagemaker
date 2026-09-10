@@ -11,7 +11,11 @@ head next to the session servers:
   before invoking the agent (loopback only in practice).
 * ``POST /v1/chat/completions`` -- looked up by the trajectory header and forwarded to
   ``<session_url>/v1/chat/completions`` on this host; streaming (SSE) is passed through
-  byte-for-byte, so TITO recording in the session server is untouched.
+  byte-for-byte, so TITO recording in the session server is untouched. The body is normalised
+  first: ``stream_options`` is dropped, because Strands hardcodes
+  ``stream_options={"include_usage": true}`` while Miles' session server pops ``stream`` to
+  drive the engine itself -- SGLang then rejects the leftover option ("Stream options can only
+  be defined when stream=True") and every trajectory dies with a 503 (seen 2026-09-10).
 * ``POST /complete-rollout``, ``POST /update-reward`` -- accepted and remembered per
   trajectory (``GET /miles/result/<tid>``); Miles grades on its own side regardless.
 * ``GET /health``.
@@ -83,10 +87,15 @@ def make_app() -> FastAPI:
             logger.warning("unknown trajectory %r from %s", tid, request.client.host if request.client else "?")
             raise HTTPException(status_code=404, detail="unknown trajectory id")
         body = await request.body()
+        wants_stream = False
         try:
-            wants_stream = bool(json.loads(body).get("stream", False))
-        except (ValueError, AttributeError):
-            wants_stream = False
+            parsed = json.loads(body)
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            wants_stream = bool(parsed.get("stream", False))
+            if parsed.pop("stream_options", None) is not None:
+                body = json.dumps(parsed).encode()
         headers = {"content-type": request.headers.get("content-type", "application/json")}
         started = time.monotonic()
         upstream_request = client.build_request("POST", f"{url}/v1/chat/completions", content=body, headers=headers)

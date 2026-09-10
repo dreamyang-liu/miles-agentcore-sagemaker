@@ -105,6 +105,10 @@ class ScriptArgs(U.ExecuteTrainConfig):
     use_dynamic_batch_size: bool = True
     # TITO family; also selects SGLang's tool-call / reasoning parser pair (see _PARSERS).
     tito_model: Literal["qwen3", "qwen35", "qwen36"] = "qwen3"
+    # Third-party agents (Strands/RFT) cannot echo reasoning_content back, which makes the
+    # default strict matcher roll the session back every turn on a thinking model. See
+    # session_message_matcher.py. Left empty = Miles' default (strict).
+    session_message_matcher: str = ""
     rollout_num_gpus_per_engine: int = 1
     sglang_mem_fraction_static: float = 0.75
     # Optimizer. 1e-6 is the full-fine-tune value; LoRA recipes run 1e-5..4e-5.
@@ -252,6 +256,8 @@ def execute(args: ScriptArgs):
         "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted "
         "--use-session-server "
         f"--tito-model {args.tito_model} "
+        + (f"--session-message-matcher {args.session_message_matcher} " if args.session_message_matcher else "")
+        + 
         "--session-server-port 30000 "
         f"--session-server-workers {args.session_server_workers} "
         f"--max-seq-len {args.max_seq_len} "
