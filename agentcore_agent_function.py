@@ -63,6 +63,10 @@ _MAX_CONCURRENT = int(os.environ.get("AGENTCORE_MAX_CONCURRENT", "16"))
 # Retryable throttles get an exponential backoff instead of costing the sample. A trial that
 # gives up here takes its whole GRPO group down with it, so it is worth waiting.
 _RETRYABLE = ("ThrottlingException", "ServiceQuotaExceededException", "RetryableConflictException")
+# Misconfiguration, not a flaky trial: returning None here would make check_no_aborted drop the
+# group, Miles resample, and the job burn GPU hours in a live-lock (2026-09-10: 2 h on a p5 over
+# an IAM policy that did not cover the runtime ARN). Raise so the job dies at the first rollout.
+_FATAL = ("AccessDeniedException", "ResourceNotFoundException", "ValidationException", "UnrecognizedClientException")
 _MAX_ATTEMPTS = int(os.environ.get("AGENTCORE_MAX_ATTEMPTS", "6"))
 _BACKOFF_BASE_S = 2.0
 _BACKOFF_CAP_S = 45.0
@@ -166,6 +170,8 @@ async def _invoke_with_backoff(arn: str, session_id: str, body: bytes, timeout: 
         except Exception as exc:
             name = type(exc).__name__
             code = getattr(exc, "response", {}).get("Error", {}).get("Code", "") if hasattr(exc, "response") else ""
+            if code in _FATAL or any(f in str(exc) for f in _FATAL):
+                raise RuntimeError(f"InvokeAgentRuntime {code or name} for {arn}: {exc}") from exc
             if code not in _RETRYABLE and not any(r in str(exc) for r in _RETRYABLE):
                 logger.warning("AgentCore invocation failed (session=%s): %s: %s", session_id, name, exc)
                 return None

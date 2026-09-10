@@ -30,7 +30,8 @@ RUNTIME = json.loads(C.RUNTIME_STATE.read_text())
 _MARKERS = re.compile(
     r"(HOST_REPORT|HEAD_READY|RAY_NODES|WORKER_RESOLVED|WORKER_JOINED|WORKER_DONE|LAUNCHER_EXIT|DONE role"
     r"|Session servers launched|trial done|rollout/raw_reward|agent metrics for rollout"
-    r"|Traceback|Error|error:|pidfd|OutOfMemory|CUDA out of memory|Killed)"
+    r"|HEAD_DNS|FRONT_DOOR_READY|forward tid|unknown trajectory|complete-rollout|update-reward|rejected /"
+    r"|AccessDenied|Traceback|Error|error:|pidfd|OutOfMemory|CUDA out of memory|Killed)"
 )
 
 
