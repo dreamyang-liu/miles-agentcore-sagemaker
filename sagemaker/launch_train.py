@@ -25,7 +25,6 @@ import sm_common as C
 
 # Built from Dockerfile.train; override to point at another repo/tag.
 IMAGE = os.environ.get("MILES_TRAIN_IMAGE", f"{C.ECR}/miles:sagemaker-agentcore")
-RUNTIME = json.loads(C.RUNTIME_STATE.read_text())
 
 _MARKERS = re.compile(
     r"(HOST_REPORT|HEAD_READY|RAY_NODES|WORKER_RESOLVED|WORKER_JOINED|WORKER_DONE|LAUNCHER_EXIT|DONE role"
@@ -36,6 +35,9 @@ _MARKERS = re.compile(
 
 
 def start(args: argparse.Namespace) -> None:
+    runtime_arn = args.runtime_arn
+    if not runtime_arn:
+        runtime_arn = json.loads(C.RUNTIME_STATE.read_text())["agentRuntimeArn"]
     name = f"miles-train-{args.mode}-{time.strftime('%Y%m%d-%H%M%S')}"
     s3 = f"s3://{C.BUCKET}/miles"
     C.sm.create_training_job(
@@ -65,7 +67,7 @@ def start(args: argparse.Namespace) -> None:
             "MILES_SM_DATASET": args.dataset,
             "MILES_SM_AGENT_MODE": args.agent_mode,
             "MILES_SM_EXTRA_ARGS": args.extra_args,
-            "AGENTCORE_RUNTIME_ARN": args.runtime_arn or RUNTIME["agentRuntimeArn"],
+            "AGENTCORE_RUNTIME_ARN": runtime_arn,
             "AWS_REGION": C.REGION,
             "AGENTCORE_MAX_CONCURRENT": str(args.agentcore_max_concurrent),
             **(

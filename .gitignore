@@ -3,3 +3,27 @@ __pycache__/
 wandb/
 sagemaker/.infra*.json
 sagemaker/.agentcore_runtime*.json
+
+# Local agent handover notes, credentials and experiment outputs.
+/STATUS.md
+.venv/
+.env
+.env.*
+*.pem
+*.key
+/agentcore_timing.json
+/decode_analysis.json
+/inference_comparison.json
+/rollout_turns.json
+/throughput_assessment.json
+/token_throughput.json
+/training_*_validation.json
+/reward_curve.*
+/reward_curve_data.json
+/reward_definition_review.json
+/artifacts/
+/models/
+/data/
+/shared_data/
+/checkpoints/
+/runs/

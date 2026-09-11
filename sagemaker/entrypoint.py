@@ -33,6 +33,7 @@ import fcntl
 import json
 import logging
 import os
+import shlex
 import shutil
 import socket
 import struct
@@ -165,6 +166,23 @@ def _start_front_door(port: int) -> subprocess.Popen:
     raise RuntimeError("rft_front_door did not become healthy")
 
 
+def _launcher_command(model_name: str, gpus: int) -> list[str]:
+    """Preserve JSON/whitespace in extra arguments without shell evaluation."""
+    train_env_vars = json.dumps({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"})
+    return [
+        sys.executable, str(LAUNCHER),
+        "--mode", os.environ.get("MILES_SM_MODE", "smoke"),
+        "--agent-mode", os.environ.get("MILES_SM_AGENT_MODE", "agentcore"),
+        "--skip-prepare", "--model-name", model_name,
+        "--dataset", os.environ.get("MILES_SM_DATASET", "gsm-hard"),
+        "--model-dir", str(MODEL_DIR), "--data-dir", str(DATA_CHANNEL),
+        "--output-dir", str(OUTPUT_DIR),
+        "--num-gpus-per-node", str(gpus),
+        "--train-env-vars", train_env_vars,
+        *shlex.split(os.environ.get("MILES_SM_EXTRA_ARGS", "")),
+    ]
+
+
 def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
     hosts = cfg["hosts"]
     model_name = os.environ.get("MILES_SM_MODEL_NAME", "Qwen3-0.6B")
@@ -214,16 +232,9 @@ def run_head(cfg: dict, own_ip: str, gpus: int) -> int:
     # expandable-segment CUDA allocations with the colocated SGLang engines during weight sync
     # ("RuntimeError: pidfd_getfd: Operation not permitted" in every engine at the first update).
     # Classic CUDA IPC handles do not need it, so the trainer runs without expandable segments.
-    train_env_vars = json.dumps({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"})
-    cmd = (
-        f"python3 {LAUNCHER} --mode {os.environ.get('MILES_SM_MODE', 'smoke')} "
-        f"--agent-mode {os.environ.get('MILES_SM_AGENT_MODE', 'agentcore')} "
-        f"--skip-prepare --model-name {model_name} --dataset {os.environ.get('MILES_SM_DATASET', 'gsm-hard')} "
-        f"--model-dir {MODEL_DIR} --data-dir {DATA_CHANNEL} --output-dir {OUTPUT_DIR} "
-        f"--num-gpus-per-node {gpus} --train-env-vars '{train_env_vars}' "
-        f"{os.environ.get('MILES_SM_EXTRA_ARGS', '')}"
-    )
-    rc = _sh(cmd, env=env, cwd=LAUNCHER.parent).returncode
+    cmd = _launcher_command(model_name, gpus)
+    logger.info("$ %s", shlex.join(cmd))
+    rc = subprocess.run(cmd, env=env, cwd=LAUNCHER.parent, check=False).returncode
     logger.info("LAUNCHER_EXIT rc=%s", rc)
     if front_door is not None:
         front_door.terminate()

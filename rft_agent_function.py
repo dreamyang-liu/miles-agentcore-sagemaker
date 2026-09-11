@@ -41,6 +41,7 @@ from agentcore_agent_function import (
     _get_semaphore,
     _invoke_with_backoff,
     _require,
+    _runtime_client,
     _session_id_of,
     _trial_timeout_s,
     abort,  # noqa: F401  -- re-exported: Miles looks up `abort` next to `run`
@@ -96,7 +97,11 @@ async def run(
     sid = _session_id_of(base_url)
 
     async with httpx.AsyncClient(timeout=10.0) as client:
-        await client.post(f"{_front_door_local()}/miles/register", json={"trajectory_id": sid, "session_url": base_url})
+        registration = await client.post(
+            f"{_front_door_local()}/miles/register", json={"trajectory_id": sid, "session_url": base_url}
+        )
+        # Invoking before the mapping exists makes every SDK inference call fail with 404.
+        registration.raise_for_status()
 
     payload = {
         "prompt": json.dumps(_rft_record(prompt, metadata), ensure_ascii=False),
@@ -119,6 +124,15 @@ async def run(
         logger.info("AgentCore invocation cancelled (session=%s)", runtime_session_id)
         return None
     finally:
+        if os.environ.get("RFT_STOP_SESSION_ON_FINISH") == "1":
+            try:
+                await asyncio.to_thread(
+                    _runtime_client().stop_runtime_session,
+                    agentRuntimeArn=arn,
+                    runtimeSessionId=runtime_session_id,
+                )
+            except Exception as exc:
+                logger.warning("Could not stop finished RFT session %s: %s", runtime_session_id, exc)
         _active_sessions.discard(runtime_session_id)
         try:
             async with httpx.AsyncClient(timeout=10.0) as client:

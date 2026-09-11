@@ -1,100 +1,256 @@
-# Prompt: connect a Bedrock AgentCore Runtime directly to a Miles session server inside a VPC
+# AgentCore VPC connection
 
-You are setting up networking so that an **Amazon Bedrock AgentCore Runtime** (the external
-agent) can open TCP connections **directly** to the Miles session servers running inside a
-**SageMaker Training Job** — no proxy, no NLB, no public IP. Miles' session server has no
-authentication, so the security group is the entire boundary. Everything below was verified
-end to end in account `<ACCOUNT>`, region `us-west-2` (2026-09-04); IDs are given as the
-concrete reference, adapt names if you rebuild elsewhere.
+The training caller invokes the **AWS AgentCore API**. The running agent then
+makes a separate **HTTP callback into the training VPC**. These require different
+permissions and network paths.
 
-## Facts you must design around
+This guide covers both an RFT SDK agent and the native example in this repository.
+See [validation](../docs/VALIDATION.md) for the distinction between historical
+private-network tests and the recent local-host HTTPS GPU run.
 
-1. **AgentCore VPC mode only lands in specific Availability Zone IDs.** In `us-west-2` those
-   are `usw2-az1`, `usw2-az2`, `usw2-az3` (**not** `usw2-az4`). The list is not in the docs;
-   `create-agent-runtime` fails with `CREATE_FAILED` and a `failureReason` naming the
-   unsupported subnet. Check with
-   `aws ec2 describe-subnets --query 'Subnets[].[SubnetId,AvailabilityZoneId]'` — AZ *names*
-   map differently per account, AZ *IDs* do not.
-2. **The AgentCore ENI only gets a private IP**, so it needs a NAT gateway (or interface
-   endpoints for `ecr.api`, `ecr.dkr`, `logs`, plus an S3 gateway endpoint) to pull the
-   agent image and write logs. A NAT is the simplest.
-3. **A SageMaker training container has exactly one interface, `eth0`, with the VPC ENI's
-   private IP**, and any port it listens on is reachable from other ENIs in the VPC when the
-   security group allows it. The container does *not* need to be in an AgentCore-supported
-   AZ — cross-AZ traffic inside the VPC is fine (verified az3 → az4).
-4. Miles spawns **all** session servers on the Ray **head** (`hosts[0]` / `algo-1`), binding
-   consecutive ports from `--session-server-port` (recipe: 30000, up to 32 workers →
-   30000–30031). Only the head's IP:ports need to be reachable.
-5. Quotas that bit: `VPCs per Region` (5) and `EC2-VPC Elastic IPs` (5, one per NAT). Check
-   both before creating anything.
+## Traffic and ports
 
-## Network to build
+| From | To | Port | Purpose |
+| --- | --- | --- | --- |
+| Training caller | AWS AgentCore API | HTTPS 443 | `InvokeAgentRuntime`, then `StopRuntimeSession` when enabled |
+| RFT agent's VPC ENI | Training head | TCP 30100 | Model requests and RFT SDK feedback |
+| Native agent's VPC ENI | Training head | TCP 30000–30031 | Per-trajectory session endpoints |
+| RFT front door | Session servers on the head | Local TCP 30000–30031 | Routing and token recording |
+| Training hosts | Other hosts of the same job | Ray/NCCL/rendezvous ports | Distributed training and inference |
 
-| Piece | Reference value | Notes |
-| --- | --- | --- |
-| VPC | `vpc-09bdc6b42c4fe9e90`, `10.20.0.0/16` | DNS support + DNS hostnames enabled |
-| Public subnet | `subnet-0bb20d330d70ed09c`, `10.20.0.0/24`, us-west-2a | holds the NAT; route `0.0.0.0/0 → IGW` |
-| Private subnets | `subnet-000c9cd0883e4e612` `10.20.1.0/24` (usw2-az2) · `subnet-05c3ab0fc851b93fd` `10.20.2.0/24` (usw2-az1) · `subnet-0df042dc329c771f2` `10.20.3.0/24` (usw2-az3) · `subnet-05f87bf0d5d99e76f` `10.20.4.0/24` (usw2-az4) | route `0.0.0.0/0 → NAT`; one per AZ so both services have room |
-| NAT gateway | `nat-00a2636f2335074a2` | in the public subnet, one EIP |
-| S3 gateway endpoint | on both route tables | SageMaker channels / checkpoints |
-| SG `miles-agentcore-train` | `sg-011aa4180a8c9c7db` | attached to the **SageMaker job** (`VpcConfig.SecurityGroupIds`). Ingress: **all traffic from itself** (Ray 6379/8265/10001+, NCCL, torch rendezvous between hosts) and **tcp 30000–30031 from `sg-056dfc0ebe7743324`**. Egress: all. |
-| SG `miles-agentcore-agentcore` | `sg-056dfc0ebe7743324` | attached to the **AgentCore runtime**. No ingress. Egress: all. |
+The port range assumes base port 30000 and 32 session-server workers. Adapt it if
+those settings change. The front door is required for an unmodified RFT agent's
+fixed-endpoint contract; `proxy.py` is not used.
 
-The single deliberate exposure is the rule `train ← agentcore : tcp 30000-30031`. Nothing else
-in the VPC (and nothing outside it) can reach the session servers.
+The native callback is:
 
-## AgentCore runtime (VPC mode)
+```text
+http://<head-private-ip>:<session-port>/sessions/<session-id>/v1
+```
 
-* Execution role needs, besides ECR read + CloudWatch logs, an inline policy allowing
-  `ec2:CreateNetworkInterface`, `ec2:CreateNetworkInterfacePermission`,
-  `ec2:DeleteNetworkInterface`, `ec2:DescribeNetworkInterfaces`, `ec2:DescribeSubnets`,
-  `ec2:DescribeSecurityGroups`, `ec2:DescribeVpcs`, `ec2:DescribeDhcpOptions`,
-  `ec2:DescribeRouteTables` (reference role: `MilesAgentCoreExecRole`).
-* Create with
+The RFT agent's fixed endpoint is:
 
-  ```json
-  "networkConfiguration": {
-    "networkMode": "VPC",
-    "networkModeConfig": {
-      "subnets": ["subnet-000c9cd0883e4e612", "subnet-05c3ab0fc851b93fd", "subnet-0df042dc329c771f2"],
-      "securityGroups": ["sg-056dfc0ebe7743324"]
-    }
-  }
-  ```
+```text
+http://<head-private-ip>:30100
+# or http://miles-head.miles.internal:30100
+```
 
-  — only the three supported-AZ subnets; including the az4 subnet fails the whole create.
-* Reference runtime: `miles_math_agent_vpc-<suffix>`
-  (`arn:aws:bedrock-agentcore:us-west-2:<ACCOUNT>:runtime/miles_math_agent_vpc-<suffix>`),
-  image `<ACCOUNT>.dkr.ecr.us-west-2.amazonaws.com/miles-agentcore-math:latest`
-  (linux/arm64 — required by the default microVM compute type).
-* The invocation payload carries the session URL directly:
-  `"base_url": "http://<head-vpc-ip>:<port>/sessions/<sid>/v1"`. The `token` field is a
-  placeholder (the OpenAI client needs a non-empty api_key; the session server ignores it).
+The agent appends `/v1/chat/completions`. The front door maps its trajectory header
+to the correct session URL. Do not expose the SGLang router/control API to the agent.
 
-## SageMaker training job side
+## VPC and security groups
 
-* `VpcConfig = {Subnets: <the four private subnets>, SecurityGroupIds: ["sg-011aa4180a8c9c7db"]}`.
-* The execution role needs `bedrock-agentcore:InvokeAgentRuntime` and
-  `bedrock-agentcore:StopRuntimeSession` on the runtime ARN (the trainer calls the agent).
-* Multi-instance: read `/opt/ml/input/config/resourceconfig.json` (`current_host`, `hosts`,
-  `network_interface_name`). `hosts[0]` starts `ray start --head --node-ip-address <its eth0 IP>`,
-  the others `ray start --address=<hosts[0]>:6379`; `algo-N` hostnames resolve via DNS. Set
-  `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME` to `network_interface_name`. Miles' own IP
-  detection (`get_host_info`) already picks the `eth0` VPC IP, so `--session-server-ip` needs
-  no override.
-* The Miles-side agent function must hand AgentCore the session URL unchanged (direct mode:
-  leave `MILES_PROXY_BASE` unset).
+Use the same VPC, or networks with explicit routes between the agent ENIs and the
+training head. Put AgentCore in private subnets supported by that service in your
+region. A NAT gateway is the reference setup's outbound path for agent dependencies
+and AWS/external API calls; an endpoint-only design must provide the endpoints its
+actual workload uses. The inference callback itself stays on the private route.
 
-## How to verify (cheap, no GPU)
+Use separate security groups:
 
-1. Run a 2-host CPU training job (e.g. `ml.m6i.large ×2`) in the VPC whose `algo-1` serves any
-   HTTP server on `0.0.0.0:30000` and logs client addresses; have `algo-2` probe
-   `http://algo-1:30000/health`.
-2. Invoke the VPC-mode runtime with `base_url = http://<algo-1 eth0 IP>:30000/sessions/<sid>/v1`.
-3. Pass = the agent returns a reply **and** `algo-1`'s log shows the request from a `10.20.x.x`
-   source (the AgentCore ENI). Verified result: `10.20.3.245 → 10.20.4.84:30000`, 200 OK, 0.9 s.
+- **Training SG:** self-ingress for communication among training hosts using that SG; TCP 30100
+  from the AgentCore SG for RFT. Add TCP 30000–30031 from that SG when using native mode.
+- **AgentCore SG:** outbound access to the training head and the agent's other required
+  destinations. No inbound listener is needed for this callback pattern.
 
-Reference implementation: `examples/experimental/agentcore/sagemaker/` in the Miles repo
-(`infra.py` builds the network idempotently, `agentcore_runtime.py` creates the runtime and
-invokes it, `smoke/` + `launch_smoke.py` is the verification above, `entrypoint.py` +
-`launch_train.py` run the real recipe).
+`infra.py` creates rules for **both** agent modes, plus NAT, an S3 gateway endpoint,
+AgentCore execution role and a private hosted zone. It is a reference builder for
+`us-west-2`: subnet AZ names/CIDRs are constants near its top. Adapt those constants
+before using another region or an existing network.
+
+The runtime helper has an **observed** `us-west-2` AZ-ID list, learned from an earlier
+create failure. Treat that as a helper default, not a permanent AWS guarantee.
+`MILES_AGENTCORE_AZ_IDS` overrides it; the helper can also retry after a service
+failure identifies unsupported subnets. AZ names and AZ IDs are different fields.
+
+## Create the reference infrastructure
+
+These commands create AWS resources. Run from the repository root with credentials
+for the target account, after building the images in the [container guide](../docs/CONTAINERS.md).
+
+```bash
+export AWS_REGION=us-west-2
+export AWS_ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+export ECR="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+export MILES_SM_ROLE_ARN='arn:aws:iam::<account>:role/<sagemaker-execution-role>'
+export MILES_SM_ROLE_NAME="${MILES_SM_ROLE_ARN##*/}"
+export MILES_SM_BUCKET='<model-data-checkpoint-bucket>'
+
+python -m pip install boto3 httpx
+python sagemaker/infra.py
+```
+
+The role named by `MILES_SM_ROLE_ARN` must already trust `sagemaker.amazonaws.com`
+and have the S3/ECR/logging permissions needed by your training job. Setting
+`MILES_SM_ROLE_NAME` lets the infrastructure helper grant that role permission to
+update the private head DNS record.
+
+State is saved in **account-specific** files:
+
+```text
+sagemaker/.infra.<account>.json
+sagemaker/.agentcore_runtime.<account>.json
+```
+
+The runtime file is written by `agentcore_runtime.py create`. These files contain
+resource IDs for your deployment and are git-ignored. Helpers use the active AWS
+credentials to select the account. Choose the agent branch below; creating another
+runtime overwrites the account's default runtime state file, so pass an explicit
+ARN to RFT launch/invoke commands when selecting an existing runtime.
+
+## RFT SDK runtime
+
+Use the image built from **your RFT agent's repository**, not `agent/Dockerfile`.
+The chosen image must support the fixed model endpoint and feedback contract
+shown in the [main README](../README.md#rft-compatibility-boundary).
+
+```bash
+export RFT_AGENT_IMAGE='<registry>/<rft-agent-repository>:<version>'
+export RFT_FRONT_DOOR_URL='http://miles-head.miles.internal:30100'
+
+python sagemaker/agentcore_runtime.py create \
+  --name miles_rft_agent_vpc \
+  --image-uri "$RFT_AGENT_IMAGE" \
+  --env "RFT_RUNTIME_ENDPOINT=$RFT_FRONT_DOOR_URL" \
+  --env "RFT_RUNTIME_URL=$RFT_FRONT_DOOR_URL"
+```
+
+Wait for `READY`. `create` updates a runtime if that name already exists; its
+network configuration comes from the current account's infrastructure file.
+It is not an arbitrary-runtime environment-only patcher.
+
+For a runtime created elsewhere, inspect its network, image and environment first:
+
+```bash
+aws bedrock-agentcore-control get-agent-runtime \
+  --agent-runtime-id '<runtime-id>' \
+  --query '{Status:status,Network:networkConfiguration,Image:agentRuntimeArtifact,Environment:environmentVariables}'
+```
+
+The RFT model client reads `RFT_RUNTIME_ENDPOINT` (or the legacy `RFT_RUNTIME_URL`).
+The invocation's `metadata.endpoint` is the SDK feedback address. Updating only
+that payload field does not redirect the model client.
+
+## Native runtime
+
+Build the native ARM64 image from this repo, then:
+
+```bash
+python sagemaker/agentcore_runtime.py create \
+  --name miles_math_agent_vpc --image-uri "$NATIVE_AGENT_IMAGE"
+```
+
+This agent accepts the session URL in each invocation. No fixed front door or DNS
+record is needed for its model callback. Leave `MILES_PROXY_BASE` unset for VPC direct mode.
+
+## IAM boundaries
+
+The AgentCore execution role trusts `bedrock-agentcore.amazonaws.com`. The reference
+helper creates a role with ECR/logging access and applies the VPC ENI policy.
+An existing role must already have the appropriate trust and base permissions.
+The ENI actions include:
+
+```text
+ec2:CreateNetworkInterface
+ec2:CreateNetworkInterfacePermission
+ec2:DeleteNetworkInterface
+ec2:DescribeNetworkInterfaces
+ec2:DescribeSubnets
+ec2:DescribeSecurityGroups
+ec2:DescribeVpcs
+ec2:DescribeDhcpOptions
+ec2:DescribeRouteTables
+```
+
+Add the permissions needed by your agent's own tools and SDK. The network helper
+cannot infer those from an arbitrary externally supplied RFT image.
+
+The **training execution role** calls AgentCore. An example inline statement is:
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["bedrock-agentcore:InvokeAgentRuntime", "bedrock-agentcore:StopRuntimeSession"],
+  "Resource": "arn:aws:bedrock-agentcore:<region>:<account>:runtime/<runtime-id>"
+}
+```
+
+The training role also needs access to its model/data/checkpoint S3 prefixes and,
+for the automated RFT DNS path, Route 53 record updates in the selected hosted zone.
+A SageMaker job must allow the outbound networking used by its agent calls;
+do not enable network isolation for this architecture.
+
+## Private IP or private DNS
+
+**A hosted zone is not a networking requirement.** A fixed EC2 training head can
+serve the RFT endpoint directly on its private IP:
+
+```bash
+# On the training head, with the VPC security groups configured:
+python -m pip install fastapi uvicorn httpx
+python rft_front_door.py --host 0.0.0.0 --port 30100
+# The external RFT agent's model endpoint is http://<head-private-ip>:30100.
+# The local Miles caller uses:
+export MILES_RFT_FRONT_DOOR_LOCAL=http://127.0.0.1:30100
+```
+
+A SageMaker job gets its head IP after the containers start. The supplied
+`entrypoint.py` reads `resourceconfig.json`, takes `hosts[0]` as the Ray head, finds
+its address through `network_interface_name`, and updates a Route 53 A record with
+TTL 30. The AgentCore runtime can keep the same fixed model endpoint across jobs.
+The entrypoint logs the update status; it does not wait for Route 53 `INSYNC`.
+Verify the name and callback path before treating the deployment as ready.
+
+The supplied **SageMaker RFT entrypoint currently requires** `MILES_HEAD_DNS` and
+`MILES_ROUTE53_ZONE_ID`. To use only a private IP with a changing SageMaker head,
+an orchestration step must discover that IP, update the agent's **model** endpoint,
+wait for the runtime to be ready and verify a new invocation before training.
+That automatic IP-registration path is not implemented here.
+
+One fixed runtime endpoint/head DNS record belongs to one active training head.
+Concurrent jobs need independent endpoints/names; otherwise an update can redirect
+one job's agents to another job's session registry.
+
+## Verify the private callback before GPU training
+
+### RFT
+
+The smoke job starts a fake session server using `finish`, starts the front door,
+updates the head DNS record and pre-registers trajectory `smoke-traj`. This lets
+an API caller outside the VPC invoke the runtime without accessing local control endpoints.
+
+```bash
+export RFT_RUNTIME_ARN='arn:aws:bedrock-agentcore:<region>:<account>:runtime/<runtime-id>'
+JOB=$(python sagemaker/launch_smoke.py start --rft --duration 1200)
+python sagemaker/launch_smoke.py watch "$JOB"
+python sagemaker/agentcore_runtime.py invoke-rft \
+  --runtime-arn "$RFT_RUNTIME_ARN" \
+  --front-door-url "$RFT_FRONT_DOOR_URL" --trajectory-id smoke-traj
+python sagemaker/launch_smoke.py logs "$JOB"
+python sagemaker/launch_smoke.py stop "$JOB"
+```
+
+Pass requires the correct answer **and** logs showing successful inference from
+an AgentCore private source address, plus `/complete-rollout` and `/update-reward`
+with HTTP 200. `HEAD_READY` or `/health` alone is not that proof. Create a fresh
+smoke session/job when repeating a full trajectory test.
+
+### Native
+
+```bash
+JOB=$(python sagemaker/launch_smoke.py start --duration 1200)
+python sagemaker/launch_smoke.py watch "$JOB"
+# Use the private address printed in HEAD_READY:
+python sagemaker/agentcore_runtime.py invoke --head-ip '<head-private-ip>'
+python sagemaker/launch_smoke.py logs "$JOB"
+python sagemaker/launch_smoke.py stop "$JOB"
+```
+
+After connectivity passes, use the [training walkthrough](../docs/TRAINING.md).
+A network mock does not validate model tokenization, gradients or checkpoint output.
+
+## AWS references
+
+- [Runtime VPC configuration and supported Availability Zones](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/agentcore-vpc.html)
+- [Runtime HTTP container contract](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-http-protocol-contract.html)
+- [Runtime IAM permissions](https://docs.aws.amazon.com/bedrock-agentcore/latest/devguide/runtime-permissions.html)

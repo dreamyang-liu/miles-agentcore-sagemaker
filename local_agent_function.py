@@ -1,8 +1,8 @@
 """In-cluster agent function that runs the AgentCore episode loop without AgentCore.
 
-Same tools, same prompt, same loop -- ``agent.run_episode`` is imported verbatim from the
-container image's source. The only difference is the network path: this talks straight to the
-session server instead of going out through the proxy and back.
+Same tools, prompt and loop as the native ``agent/agent.py`` image. This does not
+replace the separate RFT/Strands agent selected by ``--agent-mode rft``. The native
+loop talks straight to the session server instead of invoking AgentCore.
 
 That makes it the right way to bring the recipe up, because it separates two independent
 risks. Here you are testing Miles: FSDP, TITO token accounting, the reward function, and

@@ -2,8 +2,8 @@
 
 Implements the Runtime HTTP contract -- ``POST /invocations``, ``GET /ping``, port 8080 --
 and nothing else. Miles hands over a per-trajectory session endpoint plus a signed token in
-the invocation payload; every model call goes back through the proxy to that one session,
-which is what lets Miles record exact token ids for training.
+the invocation payload. Every model call uses that session URL, directly over the
+VPC or through the optional legacy public proxy. Miles records exact token ids there.
 
 Two tools are exposed to the model:
 

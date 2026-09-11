@@ -15,7 +15,8 @@ on) with ``--input-key prompt --metadata-key metadata``. Each output line is::
 
 ``answer``/``instance_id`` keep ``math_reward.py`` and the existing agent function working
 unchanged; ``rft_record`` lets an RFT-contract agent function hand the agent exactly the
-JSON string it expects. The ground truth stays on the training side of the wire either way.
+JSON string it expects. The RFT path forwards the original record, including
+ground truth, to the external agent; Miles still computes its own training reward.
 
 Usage:
     python convert_rft_parquet.py training_prompts.parquet --name rft-gsm8k --output-dir /tmp/data [--holdout 128]

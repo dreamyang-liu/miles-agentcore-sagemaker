@@ -1,0 +1,38 @@
+--train-backend megatron
+--megatron-model-type qwen3.6-27B
+--tensor-model-parallel-size 4
+--lora-rank 32
+--lora-alpha 64
+--lora-dropout 0
+--qkv-format-bshd
+--no-use-dynamic-batch-size
+--bshd-token-batching
+--max-tokens-per-gpu 20000
+--micro-batch-size 4
+--no-full-recompute
+--partial-recompute-layers 48
+--tito-model qwen36
+--session-message-matcher session_message_matcher.matches
+--rollout-num-gpus-per-engine 4
+--sglang-mem-fraction-static 0.5
+--sglang-context-length 65536
+--max-seq-len 65536
+--max-response-len 4096
+--rollout-batch-size 32
+--n-samples-per-prompt 8
+--num-rollout 3
+--rollout-max-retries 3
+--max-epochs 1
+--save-interval 3
+--no-enable-eval
+--rollout-temperature 1.0
+--rollout-top-p 1.0
+--eps-clip 0.2
+--eps-clip-high 0.2
+--lr 4e-5
+--adam-beta1 0.9
+--adam-beta2 0.95
+--adam-eps 1e-8
+--weight-decay 0
+--clip-grad 1
+--extra-env-vars '{"RFT_STOP_SESSION_ON_FINISH":"1"}'

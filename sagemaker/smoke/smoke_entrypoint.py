@@ -107,8 +107,9 @@ def _publish_head_dns(vpc_ip: str) -> None:
 
 
 def _serve_head(vpc_ip: str | None) -> None:
-    servers = [_serve(make_app(), PORT)]
-    if os.environ.get("MILES_RFT_FRONT_DOOR") == "1":
+    rft = os.environ.get("MILES_RFT_FRONT_DOOR") == "1"
+    servers = [_serve(make_app(rft=rft), PORT)]
+    if rft:
         fd_port = int(os.environ.get("MILES_RFT_FRONT_DOOR_PORT", "30100"))
         servers.append(_serve(make_front_door(), fd_port))
         _publish_head_dns(vpc_ip or "127.0.0.1")
@@ -124,6 +125,8 @@ def _serve_head(vpc_ip: str | None) -> None:
                 break
             except (httpx.HTTPError, KeyError):
                 time.sleep(1)
+        else:
+            raise RuntimeError("RFT smoke trajectory could not be registered; head is not ready")
         logger.info("FRONT_DOOR_READY port=%s trajectory_id=%s session_id=%s", fd_port, tid, sid)
     logger.info("HEAD_READY ip=%s port=%s duration_s=%s", vpc_ip, PORT, DURATION_S)
     time.sleep(DURATION_S)

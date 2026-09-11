@@ -2,10 +2,10 @@
 
 ``create`` builds (or adopts, by name) a runtime attached to the private subnets of the
 ``infra.py`` VPC with the ``miles-agentcore-agentcore`` security group. AgentCore VPC mode
-only accepts specific AZ IDs and the service does not publish the list: the runtime is
-offered every private subnet, and if it ends ``CREATE_FAILED`` naming unsupported zones, it is
-deleted and recreated without them. The zones learned for us-west-2 are pre-filled so the
-common case needs no retry.
+only accepts supported AZ IDs: check the current AgentCore VPC documentation before
+creating a runtime. The helper filters with its known/overridden list, and if creation
+ends ``CREATE_FAILED`` naming unsupported subnets, it retries without them. The
+us-west-2 defaults were learned from an earlier deployment.
 
 ``invoke`` sends the payload the agent expects, with ``base_url`` pointing straight at the
 SageMaker head's VPC IP -- no proxy, no HMAC. Use it against the network smoke

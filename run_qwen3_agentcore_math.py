@@ -4,7 +4,8 @@ The policy solves grade-school math by calling two tools -- ``calculator`` and
 ``submit_answer`` -- and the reward is whether the submitted answer matches the ground truth.
 RLVR, with the verifier inside the cluster.
 
-Two agent modes, and the difference is only where the agent loop runs:
+The native agent has local and AgentCore execution modes. The RFT mode uses a
+separate, externally supplied SageMaker-RFT agent:
 
 * ``--agent-mode local`` runs it in the trainer process against the session server directly.
   Start here: it exercises FSDP, TITO and the reward with no AWS involved.
@@ -12,6 +13,9 @@ Two agent modes, and the difference is only where the agent loop runs:
   AGENTCORE_RUNTIME_ARN. With MILES_PROXY_BASE (+ MILES_PROXY_SECRET) the agent reaches the
   session server back through the proxy; without them it connects directly, which needs the
   runtime in the same VPC as the training hosts (see ``sagemaker/``).
+* ``--agent-mode rft`` invokes an existing RFT SDK agent. Its model calls and SDK
+  callbacks go through ``rft_front_door.py``; Miles owns the training reward.
+  It is not the same prompt/tool loop as the native local agent.
 
 FSDP is chosen deliberately: it loads the HF directory as-is, so a 4B run needs no
 ``torch_dist`` conversion step at all.
@@ -99,10 +103,19 @@ class ScriptArgs(U.ExecuteTrainConfig):
         )
     )
     lora_base_cpu_backup: bool = True
-    # Megatron-core's GatedDeltaNet (bridge builds the model with it) rejects packed thd
-    # sequences, so GDN-family models train unpacked: bshd, micro-batch 1, no dynamic batching.
+    # The GDN recipe uses BSHD, with fixed microbatches or the padded-token-budget
+    # extension below. Packed THD support is not selected here.
     qkv_format_bshd: bool = False
+    micro_batch_size: int = 1
+    full_recompute: bool = True
+    # With full_recompute=False, checkpoint only this many layers per pipeline
+    # stage. Zero disables recomputation; positive values use Megatron's block mode.
+    partial_recompute_layers: int = 0
     use_dynamic_batch_size: bool = True
+    # BSHD extension: budget includes padding, and each microbatch pads separately.
+    # Use --no-use-dynamic-batch-size with this flag; the trainer init hook
+    # installs BSHD support before enabling Miles' result-order restoration.
+    bshd_token_batching: bool = False
     # TITO family; also selects SGLang's tool-call / reasoning parser pair (see _PARSERS).
     tito_model: Literal["qwen3", "qwen35", "qwen36"] = "qwen3"
     # Third-party agents (Strands/RFT) cannot echo reasoning_content back, which makes the
@@ -111,6 +124,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     session_message_matcher: str = ""
     rollout_num_gpus_per_engine: int = 1
     sglang_mem_fraction_static: float = 0.75
+    sglang_context_length: int | None = None
     # Optimizer. 1e-6 is the full-fine-tune value; LoRA recipes run 1e-5..4e-5.
     lr: float = 1e-6
     adam_beta1: float = 0.9
@@ -120,6 +134,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     clip_grad: float = 1.0
     rollout_temperature: float = 1.0
     rollout_top_p: float = 1.0
+    # PPO ratio bounds are [1 - eps_clip, 1 + eps_clip_high].
+    eps_clip: float = 0.2
+    eps_clip_high: float = 0.28
     enable_eval: bool = True
     num_gpus_per_node: int | None = 8
 
@@ -128,6 +145,9 @@ class ScriptArgs(U.ExecuteTrainConfig):
     rollout_batch_size: int = 8
     n_samples_per_prompt: int = 8
     num_rollout: int = 400
+    # Opt in to bounded RFT trajectory retries and fail-on-exhaustion batches.
+    rollout_max_retries: int | None = None
+    max_epochs: int = 1
     # max_seq_len bounds the whole trajectory (trainer packing / --max-seq-len); the per-episode
     # generation cap defaults to it and can be set lower for long-context runs.
     max_seq_len: int = 4096
@@ -148,6 +168,7 @@ class ScriptArgs(U.ExecuteTrainConfig):
     train_env_vars: str = '{"PYTORCH_CUDA_ALLOC_CONF":"expandable_segments:True"}'
 
     agentcore_runtime_arn: str = os.environ.get("AGENTCORE_RUNTIME_ARN", "")
+    agentcore_max_concurrent: int = int(os.environ.get("AGENTCORE_MAX_CONCURRENT", "16"))
     proxy_base: str = os.environ.get("MILES_PROXY_BASE", "")
     proxy_secret: str = os.environ.get("MILES_PROXY_SECRET", "")
     aws_region: str = os.environ.get("AWS_REGION", "us-west-2")
@@ -166,6 +187,21 @@ class ScriptArgs(U.ExecuteTrainConfig):
             raise ValueError("--train-backend megatron requires --megatron-model-type (and fsdp forbids it)")
         if self.lora_rank and self.train_backend != "megatron":
             raise ValueError("LoRA needs --train-backend megatron; FSDP has no LoRA in Miles")
+        if self.micro_batch_size < 1:
+            raise ValueError("--micro-batch-size must be positive")
+        if self.bshd_token_batching:
+            if self.train_backend != "megatron" or not self.qkv_format_bshd or self.use_dynamic_batch_size:
+                raise ValueError(
+                    "--bshd-token-batching requires Megatron, --qkv-format-bshd "
+                    "and --no-use-dynamic-batch-size"
+                )
+            if self.max_tokens_per_gpu <= 0:
+                raise ValueError("--bshd-token-batching requires a positive --max-tokens-per-gpu")
+        if self.partial_recompute_layers < 0 or (self.full_recompute and self.partial_recompute_layers):
+            raise ValueError("Partial recomputation requires full_recompute=False and a nonnegative layer count")
+        if self.rollout_max_retries is not None:
+            if self.agent_mode != "rft" or self.rollout_max_retries < 0 or self.max_epochs < 1:
+                raise ValueError("Bounded rollout retries require RFT mode, retries >= 0 and epochs >= 1")
         if self.agent_mode in ("agentcore", "rft"):
             if not self.agentcore_runtime_arn:
                 raise ValueError(f"--agent-mode {self.agent_mode} requires AGENTCORE_RUNTIME_ARN")
@@ -246,14 +282,21 @@ def execute(args: ScriptArgs):
             f"--eval-max-response-len {args.max_response_len or args.max_seq_len} "
         )
 
+    bounded_rft = args.rollout_max_retries is not None
+    generate_path = "rft_rollout.generate" if bounded_rft else "miles.rollout.generate_hub.agentic_tool_call.generate"
+    rollout_path = "rft_rollout.RolloutFn" if bounded_rft else "math_reward.RolloutFn"
+    filter_path = (
+        "rft_rollout.require_complete_group" if bounded_rft
+        else "miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted"
+    )
     agent_args = (
-        "--custom-generate-function-path miles.rollout.generate_hub.agentic_tool_call.generate "
+        f"--custom-generate-function-path {generate_path} "
         f"--custom-agent-function-path {args.agent_function_path} "
         "--custom-rm-path math_reward.reward_func "
-        "--rollout-function-path math_reward.RolloutFn "
+        f"--rollout-function-path {rollout_path} "
         # A trajectory that never produced a model call is useless for training; drop the
         # whole GRPO group rather than feed it a zero-variance batch.
-        "--dynamic-sampling-filter-path miles.rollout.filter_hub.dynamic_sampling_filters.check_no_aborted "
+        f"--dynamic-sampling-filter-path {filter_path} "
         "--use-session-server "
         f"--tito-model {args.tito_model} "
         + (f"--session-message-matcher {args.session_message_matcher} " if args.session_message_matcher else "")
@@ -262,12 +305,19 @@ def execute(args: ScriptArgs):
         f"--session-server-workers {args.session_server_workers} "
         f"--max-seq-len {args.max_seq_len} "
     )
+    if bounded_rft:
+        agent_args += (
+            f"--rft-rollout-max-retries {args.rollout_max_retries} "
+            f"--rft-max-epochs {args.max_epochs} "
+            f"--over-sampling-batch-size {args.rollout_batch_size} "
+        )
 
     grpo_args = (
         "--advantage-estimator grpo "
+        "--loss-type policy_loss "
         "--entropy-coef 0.00 "
-        "--eps-clip 0.2 "
-        "--eps-clip-high 0.28 "
+        f"--eps-clip {args.eps_clip} "
+        f"--eps-clip-high {args.eps_clip_high} "
     )
     if args.train_backend == "fsdp":
         grpo_args += "--use-kl-loss --kl-loss-coef 0.00 --kl-loss-type low_var_kl "
@@ -300,13 +350,21 @@ def execute(args: ScriptArgs):
             f"--tensor-model-parallel-size {args.tensor_model_parallel_size} --sequence-parallel "
             "--pipeline-model-parallel-size 1 --context-parallel-size 1 "
             "--expert-model-parallel-size 1 --expert-tensor-parallel-size 1 "
-            "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
             "--attention-dropout 0.0 --hidden-dropout 0.0 "
             "--accumulate-allreduce-grads-in-fp32 --attention-softmax-in-fp32 "
             f"--adam-eps {args.adam_eps} "
         ) + common_backend_args
+        if args.full_recompute:
+            train_backend_args += "--recompute-granularity full --recompute-method uniform --recompute-num-layers 1 "
+        elif args.partial_recompute_layers:
+            train_backend_args += (
+                "--recompute-granularity full --recompute-method block "
+                f"--recompute-num-layers {args.partial_recompute_layers} "
+            )
         if args.qkv_format_bshd:
-            train_backend_args += "--qkv-format bshd --micro-batch-size 1 "
+            train_backend_args += f"--qkv-format bshd --micro-batch-size {args.micro_batch_size} "
+        if args.bshd_token_batching:
+            train_backend_args += "--custom-megatron-init-path bshd_token_batching.install "
         if args.lora_rank:
             train_backend_args += (
                 f"--lora-rank {args.lora_rank} --lora-alpha {args.lora_alpha} --lora-dropout {args.lora_dropout} "
@@ -327,6 +385,8 @@ def execute(args: ScriptArgs):
     if args.lora_rank:
         # The engines serve the live adapter under the fixed name the session server attaches.
         sglang_args += f"--sglang-max-lora-rank {args.lora_rank} --sglang-lora-backend triton "
+    if args.sglang_context_length is not None:
+        sglang_args += f"--sglang-context-length {args.sglang_context_length} "
 
     perf_args = f"--max-tokens-per-gpu {args.max_tokens_per_gpu} "
     if args.use_dynamic_batch_size:
@@ -367,6 +427,7 @@ def execute(args: ScriptArgs):
     if args.agent_mode in ("agentcore", "rft"):
         extra_env_vars |= {
             "AGENTCORE_RUNTIME_ARN": args.agentcore_runtime_arn,
+            "AGENTCORE_MAX_CONCURRENT": str(args.agentcore_max_concurrent),
             "AWS_REGION": args.aws_region,
         }
         if args.proxy_base:

@@ -31,6 +31,7 @@ import logging
 import os
 import random
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 from urllib.parse import urlsplit
 
@@ -76,6 +77,16 @@ _active_sessions: set[str] = set()
 
 _client = None
 _semaphore: asyncio.Semaphore | None = None
+_invoke_executor: ThreadPoolExecutor | None = None
+
+
+def _get_invoke_executor() -> ThreadPoolExecutor:
+    # asyncio.to_thread's default pool otherwise limits active SDK calls to 32,
+    # regardless of the explicit AgentCore concurrency cap.
+    global _invoke_executor
+    if _invoke_executor is None:
+        _invoke_executor = ThreadPoolExecutor(max_workers=_MAX_CONCURRENT, thread_name_prefix="agentcore")
+    return _invoke_executor
 
 
 def _get_semaphore() -> asyncio.Semaphore:
@@ -103,7 +114,7 @@ def _runtime_client():
                 # Miles already retries at the sample level; a boto retry here would
                 # duplicate a trial that is merely slow.
                 retries={"max_attempts": 1, "mode": "standard"},
-                max_pool_connections=64,
+                max_pool_connections=max(64, _MAX_CONCURRENT),
             ),
         )
     return _client
@@ -163,7 +174,10 @@ async def _invoke_with_backoff(arn: str, session_id: str, body: bytes, timeout: 
     """Invoke with exponential backoff on throttles; None once the trial is genuinely lost."""
     for attempt in range(1, _MAX_ATTEMPTS + 1):
         try:
-            return await asyncio.wait_for(asyncio.to_thread(_invoke, arn, session_id, body), timeout=timeout)
+            future = asyncio.get_running_loop().run_in_executor(
+                _get_invoke_executor(), _invoke, arn, session_id, body
+            )
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
             logger.warning("AgentCore invocation timed out after %ss (session=%s)", timeout, session_id)
             return None
