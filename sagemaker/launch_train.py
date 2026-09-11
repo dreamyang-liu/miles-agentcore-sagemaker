@@ -35,6 +35,11 @@ _MARKERS = re.compile(
 
 
 def start(args: argparse.Namespace) -> None:
+    args_file = getattr(args, "args_file", None)
+    if len(args.extra_args) > 512:
+        raise ValueError("SageMaker environment values are limited to 512 characters; use --args-file")
+    if args_file and len(args_file) > 512:
+        raise ValueError("--args-file must be an image path of at most 512 characters")
     runtime_arn = args.runtime_arn
     if not runtime_arn:
         runtime_arn = json.loads(C.RUNTIME_STATE.read_text())["agentRuntimeArn"]
@@ -67,6 +72,7 @@ def start(args: argparse.Namespace) -> None:
             "MILES_SM_DATASET": args.dataset,
             "MILES_SM_AGENT_MODE": args.agent_mode,
             "MILES_SM_EXTRA_ARGS": args.extra_args,
+            **({"MILES_SM_ARGS_FILE": args_file} if args_file else {}),
             "AGENTCORE_RUNTIME_ARN": runtime_arn,
             "AWS_REGION": C.REGION,
             "AGENTCORE_MAX_CONCURRENT": str(args.agentcore_max_concurrent),
@@ -97,6 +103,7 @@ def main() -> None:
     s.add_argument("--model-name", default="Qwen3-0.6B")
     s.add_argument("--dataset", default="gsm-hard")
     s.add_argument("--extra-args", default="")
+    s.add_argument("--args-file", default=None, help="args file path inside the training image")
     s.add_argument("--agent-mode", choices=["agentcore", "rft"], default="agentcore")
     s.add_argument("--runtime-arn", default=None, help="AgentCore runtime ARN; default from the account's .agentcore_runtime file")
     s.add_argument("--agentcore-max-concurrent", type=int, default=8)

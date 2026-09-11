@@ -21,6 +21,7 @@ Environment (set by ``launch_train.py``):
     MILES_SM_DATASET         gsm8k | gsm-hard | rft-gsm8k ...
     MILES_SM_AGENT_MODE      agentcore | rft           (default agentcore)
     MILES_SM_EXTRA_ARGS      appended to the launcher command line
+    MILES_SM_ARGS_FILE       optional args file inside the image; loaded before EXTRA_ARGS
     MILES_RFT_FRONT_DOOR     "1": start rft_front_door.py on the head and publish its address as
                              MILES_HEAD_DNS (Route 53 zone MILES_ROUTE53_ZONE_ID) : MILES_RFT_FRONT_DOOR_PORT
     AGENTCORE_RUNTIME_ARN    passed through to the agent function
@@ -169,6 +170,8 @@ def _start_front_door(port: int) -> subprocess.Popen:
 def _launcher_command(model_name: str, gpus: int) -> list[str]:
     """Preserve JSON/whitespace in extra arguments without shell evaluation."""
     train_env_vars = json.dumps({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:False"})
+    args_file = os.environ.get("MILES_SM_ARGS_FILE")
+    file_args = shlex.split(Path(args_file).read_text(), comments=True) if args_file else []
     return [
         sys.executable, str(LAUNCHER),
         "--mode", os.environ.get("MILES_SM_MODE", "smoke"),
@@ -179,6 +182,7 @@ def _launcher_command(model_name: str, gpus: int) -> list[str]:
         "--output-dir", str(OUTPUT_DIR),
         "--num-gpus-per-node", str(gpus),
         "--train-env-vars", train_env_vars,
+        *file_args,
         *shlex.split(os.environ.get("MILES_SM_EXTRA_ARGS", "")),
     ]
 

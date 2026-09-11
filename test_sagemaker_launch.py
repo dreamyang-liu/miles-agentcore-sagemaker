@@ -26,6 +26,27 @@ def load_file(name, path):
 
 
 class LauncherTests(unittest.TestCase):
+    def test_image_args_file_avoids_environment_value_limit(self):
+        entrypoint = load_file("example_entrypoint_args_file", ROOT / "sagemaker/entrypoint.py")
+        path = ROOT / "configs/qwen36-rft-3step.args"
+        self.assertGreater(len(path.read_text()), 512)
+        environment = {
+            "MILES_SM_ARGS_FILE": str(path),
+            "MILES_SM_EXTRA_ARGS": "--run-id replica-test --num-rollout 5",
+        }
+        self.assertTrue(all(len(value) <= 512 for value in environment.values()))
+        with patch.dict(os.environ, environment):
+            command = entrypoint._launcher_command("Qwen3.6-27B", 8)
+        values = [
+            command[i + 1] for i, word in enumerate(command) if word == "--num-rollout"
+        ]
+        self.assertEqual(values, ["3", "5"])
+        self.assertEqual(command[command.index("--max-tokens-per-gpu") + 1], "20000")
+        self.assertEqual(
+            json.loads(command[command.index("--extra-env-vars") + 1]),
+            {"RFT_STOP_SESSION_ON_FINISH": "1"},
+        )
+
     def test_multiline_extra_args_preserve_json_and_literal_text(self):
         entrypoint = load_file("example_entrypoint", ROOT / "sagemaker/entrypoint.py")
         extras = '--num-rollout 3\n--extra-env-vars \'{"VALUE":"$(literal) with spaces"}\''
@@ -57,6 +78,7 @@ class LauncherTests(unittest.TestCase):
                     instance_type="ml.p5.48xlarge", count=1, model_name="Qwen3.6-27B",
                     dataset="test-data", max_runtime=7200, agent_mode="rft",
                     extra_args="--num-rollout 3", agentcore_max_concurrent=96,
+                    args_file="/root/miles/examples/experimental/agentcore/configs/qwen36-rft-3step.args",
                 )
                 with redirect_stdout(io.StringIO()):
                     launcher.start(args)
@@ -64,6 +86,8 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(request["Environment"]["AGENTCORE_RUNTIME_ARN"], "explicit-runtime-arn")
             self.assertEqual(request["Environment"]["MILES_RFT_FRONT_DOOR"], "1")
             self.assertEqual(request["Environment"]["AGENTCORE_MAX_CONCURRENT"], "96")
+            self.assertEqual(request["Environment"]["MILES_SM_ARGS_FILE"], args.args_file)
+            self.assertTrue(all(len(value) <= 512 for value in request["Environment"].values()))
             self.assertFalse(common.RUNTIME_STATE.exists())
 
     def test_args_file_helper_preserves_json_and_overrides(self):

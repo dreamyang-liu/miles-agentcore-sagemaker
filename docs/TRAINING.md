@@ -87,7 +87,6 @@ overrides the batch and step count to its tiny smoke settings.
 
 ```bash
 export RFT_RUNTIME_ARN='arn:aws:bedrock-agentcore:<region>:<account>:runtime/<runtime-id>'
-QWEN_ARGS="$(cat configs/qwen36-rft-3step.args)"
 
 JOB=$(python sagemaker/launch_train.py start \
   --mode normal --agent-mode rft \
@@ -95,20 +94,23 @@ JOB=$(python sagemaker/launch_train.py start \
   --instance-type ml.p5.48xlarge --count 1 \
   --model-name Qwen3.6-27B --dataset rft-gsm8k \
   --agentcore-max-concurrent 96 --max-runtime 7200 \
-  --extra-args "$QWEN_ARGS")
+  --args-file /root/miles/examples/experimental/agentcore/configs/qwen36-rft-3step.args)
 python sagemaker/launch_train.py watch "$JOB"
 ```
 
 `MILES_TRAIN_IMAGE`, `MILES_SM_ROLE_ARN`, `MILES_SM_BUCKET`, `AWS_REGION` and the
 account's infrastructure state must be configured as in the previous guides.
 An explicit `--runtime-arn` avoids needing a default runtime state file.
+SageMaker limits each environment value to 512 characters. `--args-file` passes
+only the image path; the entrypoint reads the full recipe inside the container.
+Use `--extra-args` for short overrides, which are applied after the file.
 
 The recent three-step GPU evidence was collected on a local training host with an
 HTTPS callback. Applying this recipe to SageMaker/private-VPC is a deployment to
 validate, not a claim that this exact combination already completed there.
 
-For a later 50-step run, copy the args file and change `--num-rollout 3` to 50 and
-`--save-interval 3` to 10. Budget wall time for startup and the measured step time;
+For a later 50-step run, add `--extra-args '--num-rollout 50 --save-interval 10'`.
+Budget wall time for startup and the measured step time;
 the launcher's default three-hour timeout can be too short. The full 50-step RFT
 run has not been accepted as stable.
 
@@ -174,8 +176,10 @@ docker run --rm --init --gpus all --network host --shm-size 32g \
 `run_with_args.py` parses the args file with `shlex` and executes an argument list.
 It does not evaluate the file as shell code. Arguments after `--` follow the file's
 arguments; use `--print-command` before `--` to inspect the command without running.
-The SageMaker entrypoint likewise parses `MILES_SM_EXTRA_ARGS` into an argument list,
-so multiline settings and JSON values retain their intended boundaries.
+The SageMaker entrypoint reads `MILES_SM_ARGS_FILE`, then parses short
+`MILES_SM_EXTRA_ARGS` overrides into the same argument list. Multiline settings
+and JSON values retain their intended boundaries without exceeding AWS's
+environment-value limit.
 
 ## Check outputs and stop
 
